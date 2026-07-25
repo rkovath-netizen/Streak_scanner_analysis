@@ -4,11 +4,11 @@ from upstox_data import fetch_upstox_intraday_candles
 
 def process_streak_batch(csv_files, upstox_token, strategy_type="long", tp_pct=0.05, sl_pct=0.03, max_hold_days=5, progress_callback=None):
     """
-    Parses multiple Streak CSV files and simulates exit logic candle by candle.
+    Parses multiple Streak CSV files and simulates exit logic for multi-day swing trades.
+    Uses 15-min candles across the 5-day holding period to capture exact TP/SL hits and overnight gaps.
     """
     all_signals = []
     
-    # 1. Load and combine uploaded Streak CSVs
     for file in csv_files:
         df = pd.read_csv(file)
         all_signals.append(df)
@@ -21,21 +21,17 @@ def process_streak_batch(csv_files, upstox_token, strategy_type="long", tp_pct=0
     
     trade_results = []
     total_trades = len(combined_df)
-    
-    print(f"[INFO] Loaded {total_trades} signals from {len(csv_files)} files.")
 
-    # 2. Iterate through each trade signal
     for idx, row in combined_df.iterrows():
         raw_symbol = row['seg_sym']
         entry_time = row['time']
         entry_price = float(row['ltp'])
-        
         clean_symbol = raw_symbol.replace("NSE:", "").replace("BSE:", "").strip()
 
         if progress_callback:
-            progress_callback(idx + 1, total_trades, f"Processing {clean_symbol} at {entry_time}")
+            progress_callback(idx + 1, total_trades, f"Processing Swing Trade for {clean_symbol} at {entry_time}")
 
-        # Define targets and stop loss
+        # Set TP/SL Thresholds
         if strategy_type == "long":
             target_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
@@ -43,9 +39,9 @@ def process_streak_batch(csv_files, upstox_token, strategy_type="long", tp_pct=0
             target_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
 
-        # Fetch candles covering the holding period
+        # Fetch 15-min candles spanning the next 10 calendar days (to guarantee 5 active trading days)
         fetch_start = entry_time
-        fetch_end = entry_time + timedelta(days=max_hold_days + 5) # Buffer for weekends/holidays
+        fetch_end = entry_time + timedelta(days=10) 
 
         candles_df = fetch_upstox_intraday_candles(
             symbol=clean_symbol,
@@ -56,68 +52,93 @@ def process_streak_batch(csv_files, upstox_token, strategy_type="long", tp_pct=0
         )
 
         if candles_df.empty:
-            print(f"[SKIP] No intraday data for {clean_symbol} on {entry_time}")
             continue
 
-        # Filter candles after signal timestamp
+        # Keep only candles that occurred on or after the entry timestamp
         candles_df = candles_df[candles_df['timestamp'] >= entry_time].reset_index(drop=True)
-        
         if candles_df.empty:
             continue
 
         exit_price, exit_time, exit_reason = None, None, None
         bars_in_trade = 0
-        unique_dates = []
+        unique_trading_days = []
 
-        # Candle-by-candle simulation
+        # Candle-by-candle Swing Simulation
         for i, candle in candles_df.iterrows():
             bars_in_trade += 1
             c_time = candle['timestamp']
             c_date = c_time.date()
+            open_p, high_p, low_p, close_p = candle['open'], candle['high'], candle['low'], candle['close']
 
-            if c_date not in unique_dates:
-                unique_dates.append(c_date)
+            # Track unique days the stock is held overnight
+            if c_date not in unique_trading_days:
+                unique_trading_days.append(c_date)
+                
+                # --- MARKET OPEN GAP HANDLING (For days 2, 3, 4, 5) ---
+                if len(unique_trading_days) > 1:
+                    if strategy_type == "long":
+                        if open_p >= target_price:
+                            exit_price = open_p # Gap up profit!
+                            exit_time = c_time
+                            exit_reason = f"Target Hit on Gap-Up Open"
+                            break
+                        elif open_p <= sl_price:
+                            exit_price = open_p # Gap down loss (Slippage)
+                            exit_time = c_time
+                            exit_reason = f"SL Hit on Gap-Down Open"
+                            break
+                    else: # Short setup gap handling
+                        if open_p <= target_price:
+                            exit_price = open_p # Gap down profit!
+                            exit_time = c_time
+                            exit_reason = f"Target Hit on Gap-Down Open"
+                            break
+                        elif open_p >= sl_price:
+                            exit_price = open_p # Gap up loss (Slippage)
+                            exit_time = c_time
+                            exit_reason = f"SL Hit on Gap-Up Open"
+                            break
 
-            # Check Hard Exit after N trading days
-            if len(unique_dates) > max_hold_days:
-                exit_price = candle['open']
+            # --- 5-DAY HARD EXIT TRIGGER ---
+            # If we enter a 6th trading day, we must hard exit at the market Open price
+            if len(unique_trading_days) > max_hold_days:
+                exit_price = open_p
                 exit_time = c_time
-                exit_reason = f"Time Exit ({max_hold_days} Days)"
+                exit_reason = f"Time Exit (Held {max_hold_days} Days)"
                 break
 
-            high, low = candle['high'], candle['low']
-
+            # --- INTRADAY PRICE ACTION CHECK ---
             if strategy_type == "long":
-                if high >= target_price:
+                if high_p >= target_price:
                     exit_price = target_price
                     exit_time = c_time
                     exit_reason = f"Target Hit (+{tp_pct*100:.1f}%)"
                     break
-                elif low <= sl_price:
+                elif low_p <= sl_price:
                     exit_price = sl_price
                     exit_time = c_time
                     exit_reason = f"SL Hit (-{sl_pct*100:.1f}%)"
                     break
             else: # Short setup logic
-                if low <= target_price:
+                if low_p <= target_price:
                     exit_price = target_price
                     exit_time = c_time
                     exit_reason = f"Target Hit (+{tp_pct*100:.1f}%)"
                     break
-                elif high >= sl_price:
+                elif high_p >= sl_price:
                     exit_price = sl_price
                     exit_time = c_time
                     exit_reason = f"SL Hit (-{sl_pct*100:.1f}%)"
                     break
 
-        # Fallback if trade remains open at end of data window
+        # Fallback if the trade is still open at the end of the fetched historical data
         if exit_price is None:
             last_candle = candles_df.iloc[-1]
             exit_price = last_candle['close']
             exit_time = last_candle['timestamp']
-            exit_reason = "Data Ended (Open Position)"
+            exit_reason = f"Data Ended (Holding Day {len(unique_trading_days)})"
 
-        # Calculate PnL
+        # Calculate final Absolute and % PnL based on direction
         if strategy_type == "long":
             pnl_abs = exit_price - entry_price
         else:
@@ -135,6 +156,7 @@ def process_streak_batch(csv_files, upstox_token, strategy_type="long", tp_pct=0
             'exit_price': round(exit_price, 2),
             'pnl_abs': round(pnl_abs, 2),
             'pnl_pct': round(pnl_pct, 2),
+            'days_held': len(unique_trading_days),
             'bars_in_trade': bars_in_trade,
             'exit_reason': exit_reason
         })
