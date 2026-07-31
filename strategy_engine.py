@@ -16,6 +16,9 @@ def process_streak_options_batch(csv_files, upstox_token, strategy_type, tp_pct,
     combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
     combined_df = combined_df.dropna(subset=['time']) 
 
+    # --- THE FIX: Strip Timezone offsets to make it compatible with Upstox data ---
+    combined_df['time'] = combined_df['time'].apply(lambda x: x.replace(tzinfo=None))
+
     trade_results = []
     audit_logs = []
     total_trades = len(combined_df)
@@ -24,6 +27,8 @@ def process_streak_options_batch(csv_files, upstox_token, strategy_type, tp_pct,
         cash_symbol = str(row['seg_sym']).replace("NSE:", "").replace("BSE:", "").strip()
         signal_time = row['time']
         cash_ltp = float(row.get('ltp', 0.0))
+        
+        # Determines Call (CE) or Put (PE) based on your UI selection
         opt_type = "CE" if strategy_type == "long" else "PE"
 
         if progress_callback: 
