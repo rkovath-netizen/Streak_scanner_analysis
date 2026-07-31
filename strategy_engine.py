@@ -1,174 +1,160 @@
 import pandas as pd
 from datetime import timedelta
-from upstox_data import get_atm_option_instrument, fetch_upstox_intraday_candles
+from upstox_data import fetch_upstox_intraday_candles, get_nfo_lot_size, get_option_legs
 
-def process_streak_options_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct, max_hold_days, progress_callback, ui_log):
+def get_premium_at_time(df, target_time, use_open=False):
+    """Gets the option price at the exact exit time, handling missing illiquid candles gracefully."""
+    past_candles = df[df['timestamp'] <= target_time]
+    if not past_candles.empty:
+        return past_candles.iloc[-1]['open'] if use_open else past_candles.iloc[-1]['close']
+    future_candles = df[df['timestamp'] >= target_time]
+    if not future_candles.empty:
+        return future_candles.iloc[0]['open']
+    return 0.0
+
+def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct, max_hold_days, progress_callback=None):
     all_signals = []
-    
-    ui_log(f"📥 Attempting to load {len(csv_files)} uploaded files...")
-    
-    for f in csv_files:
-        # 1. FIX: Reset Streamlit file pointer to the beginning (vital for multiple runs)
-        f.seek(0) 
-        try:
-            df = pd.read_csv(f)
-            df.columns = df.columns.str.strip().str.lower()
-            
-            # 2. FIX: Flexible Time Column Detector
-            if 'time' not in df.columns:
-                if 'date' in df.columns:
-                    df['time'] = df['date']
-                elif 'timestamp' in df.columns:
-                    df['time'] = df['timestamp']
-                else:
-                    ui_log(f"⚠️ Skipping {f.name}: Could not find a 'time' or 'date' column.")
-                    continue
-                    
-            ui_log(f"✅ Loaded '{f.name}' ({len(df)} signals)")
-            all_signals.append(df)
-        except Exception as e:
-            ui_log(f"❌ Failed to parse '{f.name}': {e}")
-
-    if not all_signals: 
-        ui_log("❌ No valid data found in any uploaded files.")
-        return pd.DataFrame(), pd.DataFrame()
+    for file in csv_files:
+        all_signals.append(pd.read_csv(file))
         
+    if not all_signals:
+        return pd.DataFrame()
+
     combined_df = pd.concat(all_signals, ignore_index=True)
-    combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
+    combined_df['time'] = pd.to_datetime(combined_df['time'])
     
-    # Drop rows where time couldn't be parsed
-    initial_len = len(combined_df)
-    combined_df = combined_df.dropna(subset=['time']) 
-    if len(combined_df) < initial_len:
-        ui_log(f"⚠️ Dropped {initial_len - len(combined_df)} rows due to invalid timestamp formats.")
-
-    # Strip Timezone offsets to make it compatible with Upstox data
-    combined_df['time'] = combined_df['time'].apply(lambda x: x.replace(tzinfo=None))
-
     trade_results = []
-    audit_logs = []
     total_trades = len(combined_df)
-    
-    ui_log(f"🚀 Starting Options backtest on {total_trades} total combined signals...")
 
     for idx, row in combined_df.iterrows():
-        # Safeguard against missing seg_sym column
-        if 'seg_sym' not in row:
-            continue
-            
-        cash_symbol = str(row['seg_sym']).replace("NSE:", "").replace("BSE:", "").strip()
-        signal_time = row['time']
-        cash_ltp = float(row.get('ltp', 0.0))
+        raw_symbol = row['seg_sym']
+        entry_time = row['time']
+        entry_price = float(row['ltp'])
+        clean_symbol = raw_symbol.replace("NSE:", "").replace("BSE:", "").strip()
+        lot_size = get_nfo_lot_size(clean_symbol)
+
+        if progress_callback:
+            progress_callback(idx + 1, total_trades, f"Processing {clean_symbol} at {entry_time}")
+
+        # Direction mapping based on strategy
+        is_bullish = strategy_type in ["Long Equity", "Options: Long Straddle", "Options: Bull Put Spread (ATM & OTM1)", "Options: Bull Put Spread (ATM & OTM2)"]
         
-        opt_type = "CE" if strategy_type == "long" else "PE"
+        target_price = entry_price * (1 + tp_pct) if is_bullish else entry_price * (1 - tp_pct)
+        sl_price = entry_price * (1 - sl_pct) if is_bullish else entry_price * (1 + sl_pct)
 
-        if progress_callback: 
-            progress_callback(idx + 1, total_trades, f"Processing {cash_symbol}")
+        fetch_start = entry_time
+        fetch_end = entry_time + timedelta(days=10) 
 
-        # 1. ATM Mapping
-        inst_key, opt_symbol, map_status = get_atm_option_instrument(cash_symbol, signal_time, cash_ltp, opt_type, ui_log)
-        
-        if not inst_key:
-            audit_logs.append({
-                'cash_symbol': cash_symbol,
-                'signal_time': signal_time,
-                'cash_ltp': cash_ltp,
-                'status': 'FAILED',
-                'reason': map_status,
-                'options_contract': 'N/A'
-            })
+        candles_df = fetch_upstox_intraday_candles(
+            symbol_or_key=clean_symbol, start_dt=fetch_start, end_dt=fetch_end, 
+            access_token=upstox_token, interval="15minute", is_key=False
+        )
+
+        if candles_df.empty:
             continue
 
-        # 2. Data Fetch
-        fetch_start = signal_time
-        fetch_end = signal_time + timedelta(days=10)
-        opt_candles = fetch_upstox_intraday_candles(inst_key, fetch_start, fetch_end, upstox_token, ui_log)
-        
-        if opt_candles.empty:
-            audit_logs.append({
-                'cash_symbol': cash_symbol,
-                'signal_time': signal_time,
-                'cash_ltp': cash_ltp,
-                'status': 'FAILED',
-                'reason': '0 Candles Returned (Illiquid / Expired)',
-                'options_contract': opt_symbol
-            })
+        candles_df = candles_df[candles_df['timestamp'] >= entry_time].reset_index(drop=True)
+        if candles_df.empty:
             continue
 
-        opt_candles = opt_candles[opt_candles['timestamp'] >= signal_time].reset_index(drop=True)
-        if opt_candles.empty:
-            audit_logs.append({
-                'cash_symbol': cash_symbol,
-                'signal_time': signal_time,
-                'cash_ltp': cash_ltp,
-                'status': 'FAILED',
-                'reason': 'No Candles Strictly After Signal Time',
-                'options_contract': opt_symbol
-            })
-            continue
+        exit_time, exit_reason, is_gap_exit = None, None, False
+        unique_days = []
 
-        # 3. Simulate Trade
-        opt_entry_price = opt_candles.iloc[0]['close'] 
-        target_price = opt_entry_price * (1 + tp_pct)
-        sl_price = opt_entry_price * (1 - sl_pct)
-
-        exit_price, exit_time, exit_reason = None, None, None
-        bars_in_trade, unique_days = 0, []
-
-        for i, candle in opt_candles.iterrows():
-            bars_in_trade += 1
-            c_time, open_p, high_p, low_p = candle['timestamp'], candle['open'], candle['high'], candle['low']
-            c_date = c_time.date()
+        # 1. Simulate Underlying to find Exit Time (Max 5 days)
+        for i, candle in candles_df.iterrows():
+            c_time, c_date = candle['timestamp'], candle['timestamp'].date()
+            open_p, high_p, low_p = candle['open'], candle['high'], candle['low']
 
             if c_date not in unique_days:
                 unique_days.append(c_date)
                 if len(unique_days) > 1:
-                    if open_p >= target_price:
-                        exit_price, exit_time, exit_reason = open_p, c_time, "Target Hit (Gap-Up)"
-                        break
-                    elif open_p <= sl_price:
-                        exit_price, exit_time, exit_reason = open_p, c_time, "SL Hit (Gap-Down)"
-                        break
+                    # Gap checks
+                    if is_bullish:
+                        if open_p >= target_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
+                        elif open_p <= sl_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
+                    else:
+                        if open_p <= target_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
+                        elif open_p >= sl_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
 
             if len(unique_days) > max_hold_days:
-                exit_price, exit_time, exit_reason = open_p, c_time, f"Time Exit ({max_hold_days} Days)"
-                break
+                exit_time, exit_reason, is_gap_exit = c_time, f"Time Exit ({max_hold_days} Days)", True; break
 
-            if high_p >= target_price:
-                exit_price, exit_time, exit_reason = target_price, c_time, "Target Hit"
-                break
-            elif low_p <= sl_price:
-                exit_price, exit_time, exit_reason = sl_price, c_time, "SL Hit"
-                break
+            # Intraday checks
+            if is_bullish:
+                if high_p >= target_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif low_p <= sl_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+            else:
+                if low_p <= target_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif high_p >= sl_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
 
-        if exit_price is None:
-            last = opt_candles.iloc[-1]
-            exit_price, exit_time, exit_reason = last['close'], last['timestamp'], "Data Ended"
+        if not exit_time:
+            exit_time = candles_df.iloc[-1]['timestamp']
+            exit_reason = "Data Ended"
+            is_gap_exit = False
 
-        pnl_abs = exit_price - opt_entry_price
-        
+        # 2. Calculate PnL based on Strategy
+        pnl_abs = 0.0
+        details = ""
+
+        if strategy_type == "Long Equity":
+            underlying_exit = candles_df[candles_df['timestamp'] == exit_time].iloc[0]
+            exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
+            pnl_abs = (exit_price - entry_price) * lot_size
+            details = f"Entry: {entry_price}, Exit: {exit_price}"
+            pnl_pct = (pnl_abs / (entry_price * lot_size)) * 100
+
+        elif strategy_type == "Short Equity":
+            underlying_exit = candles_df[candles_df['timestamp'] == exit_time].iloc[0]
+            exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
+            pnl_abs = (entry_price - exit_price) * lot_size
+            details = f"Entry: {entry_price}, Exit: {exit_price}"
+            pnl_pct = (pnl_abs / (entry_price * lot_size)) * 100
+
+        else: # OPTIONS STRATEGIES
+            legs = get_option_legs(clean_symbol, entry_time, entry_price, strategy_type)
+            if not legs:
+                continue # Skip if option chain missing
+                
+            total_premium_involved = 0.0
+            
+            for leg in legs:
+                leg_df = fetch_upstox_intraday_candles(
+                    leg['key'], entry_time, exit_time + timedelta(days=1), 
+                    upstox_token, is_key=True
+                )
+                if leg_df.empty: continue
+                
+                leg_entry = get_premium_at_time(leg_df, entry_time, use_open=False)
+                leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
+                
+                # Formula: (Exit - Entry) * Direction * Lot Size
+                leg_pnl = (leg_exit - leg_entry) * leg['side'] * lot_size
+                pnl_abs += leg_pnl
+                
+                action = "Buy" if leg['side'] == 1 else "Sell"
+                details += f"[{leg['type']}: {action} @ {leg_entry:.2f}, Exit @ {leg_exit:.2f}] "
+                total_premium_involved += leg_entry * lot_size
+
+            pnl_pct = (pnl_abs / total_premium_involved) * 100 if total_premium_involved > 0 else 0
+
         trade_results.append({
-            'cash_symbol': cash_symbol,
-            'cash_signal_price': round(cash_ltp, 2),
-            'options_contract': opt_symbol,
-            'entry_date': signal_time.strftime("%Y-%m-%d %H:%M:%S"),
-            'opt_entry_price': round(opt_entry_price, 2),
-            'exit_date': exit_time.strftime("%Y-%m-%d %H:%M:%S"),
-            'opt_exit_price': round(exit_price, 2),
+            'symbol': clean_symbol,
+            'lot_size': lot_size,
+            'entry_time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'exit_time': exit_time.strftime("%Y-%m-%d %H:%M:%S"),
             'pnl_abs': round(pnl_abs, 2),
-            'pnl_pct': round((pnl_abs / opt_entry_price) * 100, 2),
+            'pnl_pct': round(pnl_pct, 2),
             'days_held': len(unique_days),
-            'bars_in_trade': bars_in_trade,
-            'exit_reason': exit_reason
+            'exit_reason': exit_reason,
+            'trade_details': details
         })
 
-        audit_logs.append({
-            'cash_symbol': cash_symbol,
-            'signal_time': signal_time,
-            'cash_ltp': cash_ltp,
-            'status': 'SUCCESS',
-            'reason': 'Trade Executed',
-            'options_contract': opt_symbol
-        })
-
-    return pd.DataFrame(trade_results), pd.DataFrame(audit_logs)
+    return pd.DataFrame(trade_results)
