@@ -4,31 +4,62 @@ from upstox_data import get_atm_option_instrument, fetch_upstox_intraday_candles
 
 def process_streak_options_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct, max_hold_days, progress_callback, ui_log):
     all_signals = []
+    
+    ui_log(f"📥 Attempting to load {len(csv_files)} uploaded files...")
+    
     for f in csv_files:
-        df = pd.read_csv(f)
-        df.columns = df.columns.str.strip().str.lower()
-        all_signals.append(df)
+        # 1. FIX: Reset Streamlit file pointer to the beginning (vital for multiple runs)
+        f.seek(0) 
+        try:
+            df = pd.read_csv(f)
+            df.columns = df.columns.str.strip().str.lower()
+            
+            # 2. FIX: Flexible Time Column Detector
+            if 'time' not in df.columns:
+                if 'date' in df.columns:
+                    df['time'] = df['date']
+                elif 'timestamp' in df.columns:
+                    df['time'] = df['timestamp']
+                else:
+                    ui_log(f"⚠️ Skipping {f.name}: Could not find a 'time' or 'date' column.")
+                    continue
+                    
+            ui_log(f"✅ Loaded '{f.name}' ({len(df)} signals)")
+            all_signals.append(df)
+        except Exception as e:
+            ui_log(f"❌ Failed to parse '{f.name}': {e}")
 
     if not all_signals: 
+        ui_log("❌ No valid data found in any uploaded files.")
         return pd.DataFrame(), pd.DataFrame()
         
     combined_df = pd.concat(all_signals, ignore_index=True)
     combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
+    
+    # Drop rows where time couldn't be parsed
+    initial_len = len(combined_df)
     combined_df = combined_df.dropna(subset=['time']) 
+    if len(combined_df) < initial_len:
+        ui_log(f"⚠️ Dropped {initial_len - len(combined_df)} rows due to invalid timestamp formats.")
 
-    # --- THE FIX: Strip Timezone offsets to make it compatible with Upstox data ---
+    # Strip Timezone offsets to make it compatible with Upstox data
     combined_df['time'] = combined_df['time'].apply(lambda x: x.replace(tzinfo=None))
 
     trade_results = []
     audit_logs = []
     total_trades = len(combined_df)
+    
+    ui_log(f"🚀 Starting Options backtest on {total_trades} total combined signals...")
 
     for idx, row in combined_df.iterrows():
+        # Safeguard against missing seg_sym column
+        if 'seg_sym' not in row:
+            continue
+            
         cash_symbol = str(row['seg_sym']).replace("NSE:", "").replace("BSE:", "").strip()
         signal_time = row['time']
         cash_ltp = float(row.get('ltp', 0.0))
         
-        # Determines Call (CE) or Put (PE) based on your UI selection
         opt_type = "CE" if strategy_type == "long" else "PE"
 
         if progress_callback: 
