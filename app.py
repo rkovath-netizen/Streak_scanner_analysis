@@ -1,94 +1,65 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-from strategy_engine import process_streak_batch
-from metrics_calculator import calculate_advanced_metrics
+from strategy_engine import process_streak_options_batch
 from github_utils import push_csv_to_github
+from metrics_calculator import calculate_advanced_metrics
 
-# --- 1. Page Config & Secrets Initialization ---
-st.set_page_config(page_title="Streak Scanner Backtest Engine", layout="wide")
-st.title("📈 Streak Swing Backtest Engine (5-Day Hold)")
+st.set_page_config(page_title="Streak Options Backtester", layout="wide")
+st.title("📈 Streak ATM Options Backtest Engine")
 
-# Explicitly fetch all required tokens from Streamlit Secrets
 try:
     UPSTOX_TOKEN = st.secrets["UPSTOX_ACCESS_TOKEN"]
     GITHUB_PAT = st.secrets["GITHUB_PAT"]
     GITHUB_REPO = st.secrets["GITHUB_REPO"]
     GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
 except KeyError as e:
-    st.error(f"⚠️ Missing secret: {e}. Please add it to your Streamlit secrets.")
+    st.error(f"⚠️ Missing secret: {e}")
     st.stop()
 
-# --- 2. Sidebar Configuration ---
-st.sidebar.header("⚙️ Configuration Settings")
+st.sidebar.header("⚙️ Settings")
 strategy_name = st.sidebar.text_input("Strategy Name", value="15_MT_Momentum")
-strategy_type = st.sidebar.selectbox("Setup Direction", ["long", "short"])
-tp_pct = st.sidebar.number_input("Target Profit (%)", min_value=0.5, value=5.0) / 100.0
-sl_pct = st.sidebar.number_input("Stop Loss (%)", min_value=0.5, value=3.0) / 100.0
-max_hold_days = st.sidebar.number_input("Max Holding Days", min_value=1, value=5)
+strategy_type = st.sidebar.selectbox("Signal Type", ["long", "short"])
+st.sidebar.caption("Long = Buy CE | Short = Buy PE")
 
-# --- 3. File Upload Section ---
-uploaded_files = st.file_uploader(
-    "Upload Zerodha Streak CSV Exports", 
-    type=["csv"], 
-    accept_multiple_files=True
-)
+tp_pct = st.sidebar.number_input("Target Profit on Premium (%)", min_value=0.5, value=5.0) / 100.0
+sl_pct = st.sidebar.number_input("Stop Loss on Premium (%)", min_value=0.5, value=3.0) / 100.0
+max_hold = st.sidebar.number_input("Max Holding Days", min_value=1, value=5)
 
-if uploaded_files and st.button("🚀 Run Backtest"):
+uploaded_files = st.file_uploader("Upload Cash Signal CSVs", type=["csv"], accept_multiple_files=True)
+
+if uploaded_files and st.button("🚀 Run Options Backtest"):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    def update_progress(current, total, message):
-        pct = int((current / total) * 100)
-        progress_bar.progress(pct)
-        status_text.text(f"[{current}/{total}] {message}")
+    def progress_update(current, total, msg):
+        progress_bar.progress(int((current / total) * 100))
+        status_text.text(f"[{current}/{total}] {msg}")
 
-    with st.spinner("Simulating trades via Upstox intraday data..."):
-        trades_df = process_streak_batch(
-            csv_files=uploaded_files,
-            upstox_token=UPSTOX_TOKEN,
-            strategy_type=strategy_type,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            max_hold_days=max_hold_days,
-            progress_callback=update_progress
+    with st.spinner("Mapping to ATM Options & Fetching Data..."):
+        trades_df = process_streak_options_batch(
+            uploaded_files, UPSTOX_TOKEN, strategy_type, tp_pct, sl_pct, max_hold, progress_update
         )
 
     if trades_df.empty:
-        st.error("No trades executed or market data missing.")
+        st.error("No valid options trades could be executed.")
     else:
-        st.success("✅ Backtest Execution Complete!")
-
-        # --- 4. Render Metrics ---
-        overall_metrics, stock_summary = calculate_advanced_metrics(trades_df)
+        st.success("✅ Backtest Complete!")
         
-        st.subheader("📊 Portfolio Performance Summary")
-        m_cols = st.columns(4)
-        m_cols[0].metric("Total Trades", overall_metrics["Total Trades"])
-        m_cols[1].metric("Win Rate", f"{overall_metrics['Win Rate (%)']}%")
-        m_cols[2].metric("Total PnL (Abs)", f"₹{overall_metrics['Total PnL (Abs)']}")
-        m_cols[3].metric("Max Drawdown", f"₹{overall_metrics['Max Drawdown (Abs)']}")
+        overall, stock_stats = calculate_advanced_metrics(trades_df)
+        st.subheader("📊 Portfolio Stats")
+        cols = st.columns(4)
+        cols[0].metric("Total Trades", overall.get("Total Trades", 0))
+        cols[1].metric("Win Rate", f"{overall.get('Win Rate (%)', 0)}%")
+        cols[2].metric("Total PnL", f"₹{overall.get('Total PnL (Abs)', 0)}")
+        cols[3].metric("Max Drawdown", f"₹{overall.get('Max Drawdown (Abs)', 0)}")
 
-        st.subheader("📌 Stock Level Summary")
-        st.dataframe(stock_summary, use_container_width=True)
-
-        st.subheader("📄 Detailed Trade Log")
+        st.subheader("📄 Options Trade Log")
         st.dataframe(trades_df, use_container_width=True)
 
-        # --- 5. Export to GitHub ---
         csv_buffer = trades_df.to_csv(index=False)
         st.markdown("---")
-        
-        if st.button("🐙 Save Output to GitHub"):
-            with st.spinner("Pushing file to GitHub repository..."):
-                success, response_msg = push_csv_to_github(
-                    csv_content=csv_buffer,
-                    strategy_name=strategy_name,
-                    pat_token=GITHUB_PAT,
-                    repo_name=GITHUB_REPO,
-                    branch=GITHUB_BRANCH
-                )
-                if success:
-                    st.success(f"✅ Successfully saved to GitHub: `{response_msg}`")
-                else:
-                    st.error(f"❌ GitHub Commit failed: {response_msg}")
+        if st.button("🐙 Export to GitHub (output/ folder)"):
+            with st.spinner("Pushing..."):
+                ok, res = push_csv_to_github(csv_buffer, strategy_name, GITHUB_PAT, GITHUB_REPO, GITHUB_BRANCH)
+                if ok: st.success(f"✅ Saved to GitHub: `{res}`")
+                else: st.error(f"❌ Failed: {res}")
