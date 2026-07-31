@@ -1,121 +1,91 @@
 import streamlit as st
 import pandas as pd
-import traceback
-from strategy_engine import process_streak_options_batch
-from github_utils import push_results_and_logs_to_github
+from datetime import datetime
+from strategy_engine import process_streak_batch
 from metrics_calculator import calculate_advanced_metrics
+from github_utils import push_csv_to_github
 
-st.set_page_config(page_title="Streak Options Backtester", layout="wide")
-st.title("📈 Streak ATM Options Backtest Engine")
+st.set_page_config(page_title="Streak & Options Backtester", layout="wide")
+st.title("📈 Streak Momentum & Options Spread Backtester")
 
-try:
-    UPSTOX_TOKEN = st.secrets["UPSTOX_ACCESS_TOKEN"]
-    GITHUB_PAT = st.secrets["GITHUB_PAT"]
-    GITHUB_REPO = st.secrets["GITHUB_REPO"]
-    GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
-except KeyError as e:
-    st.error(f"⚠️ Missing secret in `.streamlit/secrets.toml`: {e}")
-    st.stop()
-
-st.sidebar.header("⚙️ Settings")
+# Sidebar Configuration
+st.sidebar.header("⚙️ Configuration")
 strategy_name = st.sidebar.text_input("Strategy Name", value="15_MT_Momentum")
-strategy_type = st.sidebar.selectbox("Signal Type", ["long", "short"])
 
-tp_pct = st.sidebar.number_input("Target Profit (%)", min_value=0.5, value=5.0) / 100.0
-sl_pct = st.sidebar.number_input("Stop Loss (%)", min_value=0.5, value=3.0) / 100.0
-max_hold = st.sidebar.number_input("Max Holding Days", min_value=1, value=5)
+# The 7 Strategies including the 5 new Options strategies
+strategy_options = [
+    "Long Equity", 
+    "Short Equity", 
+    "Options: Long Straddle", 
+    "Options: Bull Put Spread (ATM & OTM1)",
+    "Options: Bull Put Spread (ATM & OTM2)",
+    "Options: Bear Call Spread (ATM & OTM1)",
+    "Options: Bear Call Spread (ATM & OTM2)"
+]
+selected_strategy = st.sidebar.selectbox("Select Strategy", strategy_options)
 
-uploaded_files = st.file_uploader("Upload Cash Signal CSVs", type=["csv"], accept_multiple_files=True)
+tp_pct = st.sidebar.number_input("Underlying Target Profit (%)", min_value=0.5, value=5.0, step=0.5) / 100.0
+sl_pct = st.sidebar.number_input("Underlying Stop Loss (%)", min_value=0.5, value=3.0, step=0.5) / 100.0
+max_hold_days = st.sidebar.number_input("Max Holding Days", min_value=1, value=5, step=1)
 
-if uploaded_files and st.button("🚀 Run Options Backtest"):
+# Retrieve Secrets safely
+try:
+    upstox_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
+    github_pat = st.secrets["GITHUB_PAT"]
+    github_repo = st.secrets["GITHUB_REPO"]
+    github_branch = st.secrets.get("GITHUB_BRANCH", "main")
+    secrets_loaded = True
+except KeyError as e:
+    secrets_loaded = False
+    st.sidebar.error(f"⚠️ Missing Secret: {e}")
+
+# File Upload
+uploaded_files = st.file_uploader("Upload Streak CSV Scanner Exports", type=["csv"], accept_multiple_files=True)
+
+if uploaded_files and secrets_loaded and st.button("🚀 Run Options Backtest"):
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    full_logs = []
-    
-    def ui_log(msg):
-        full_logs.append(msg)
 
-    def progress_update(current, total, msg):
+    def update_progress(current, total, message):
         progress_bar.progress(int((current / total) * 100))
-        status_text.text(f"[{current}/{total}] {msg}")
+        status_text.text(f"[{current}/{total}] {message}")
 
-    try:
-        with st.spinner("Mapping & Fetching Options..."):
-            trades_df, audit_df = process_streak_options_batch(
-                uploaded_files, UPSTOX_TOKEN, strategy_type, tp_pct, sl_pct, max_hold, progress_update, ui_log
-            )
+    with st.spinner("Simulating trades and fetching Option Chains..."):
+        trades_df = process_streak_batch(
+            csv_files=uploaded_files, upstox_token=upstox_token,
+            strategy_type=selected_strategy, tp_pct=tp_pct, sl_pct=sl_pct,
+            max_hold_days=max_hold_days, progress_callback=update_progress
+        )
 
-        st.success("✅ Execution Finished!")
+    if trades_df.empty:
+        st.error("No trades executed or market data missing.")
+    else:
+        st.success("✅ Backtest Complete!")
+        overall_metrics, stock_summary = calculate_advanced_metrics(trades_df)
 
-        # 1. Metrics & Overview
-        if not trades_df.empty:
-            overall, stock_stats = calculate_advanced_metrics(trades_df)
-            st.subheader("📊 Portfolio Performance Summary")
-            cols = st.columns(4)
-            cols[0].metric("Total Executed Trades", overall.get("Total Trades", 0))
-            cols[1].metric("Win Rate", f"{overall.get('Win Rate (%)', 0)}%")
-            cols[2].metric("Total PnL", f"₹{overall.get('Total PnL (Abs)', 0)}")
-            cols[3].metric("Max Drawdown", f"₹{overall.get('Max Drawdown (Abs)', 0)}")
+        m_cols = st.columns(4)
+        m_cols[0].metric("Total Trades", overall_metrics["Total Trades"])
+        m_cols[1].metric("Win Rate", f"{overall_metrics['Win Rate (%)']}%")
+        m_cols[2].metric("Total PnL", f"₹{overall_metrics['Total PnL (₹)']}")
+        m_cols[3].metric("Max Drawdown", f"₹{overall_metrics['Max Drawdown (₹)']}")
 
-        # 2. Tabs for Results, Audit Diagnostics, and Full Raw Logs
-        tab1, tab2, tab3 = st.tabs(["📄 Executed Trades", "🔍 Signal Audit Diagnostics", "📜 Live Execution Logs"])
+        st.subheader("📄 Trade Log (Prices Adjusted for Lot Size)")
+        st.dataframe(trades_df, use_container_width=True)
 
-        with tab1:
-            if trades_df.empty:
-                st.warning("No trades were successfully executed.")
-            else:
-                st.dataframe(trades_df, use_container_width=True)
-
-        with tab2:
-            st.subheader("Signal Audit (All Uploaded Signals)")
-            if not audit_df.empty:
-                st.dataframe(audit_df, use_container_width=True)
-
-        with tab3:
-            st.subheader("Full Raw Execution Logs")
-            full_log_text = "\n".join(full_logs)
-            st.text_area("Logs", value=full_log_text, height=300)
-
-        # 3. Downloads & GitHub Export
+        # Export Logic
+        csv_buffer = trades_df.to_csv(index=False)
         st.markdown("---")
-        col_dl_csv, col_dl_log, col_gh = st.columns(3)
+        col1, col2 = st.columns(2)
+        
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_filename = f"{strategy_name.lower()}_{timestamp_str}.csv"
 
-        csv_data = trades_df.to_csv(index=False)
-        log_data = "\n".join(full_logs)
-
-        with col_dl_csv:
-            st.download_button(
-                label="📥 Download Trades CSV",
-                data=csv_data,
-                file_name=f"{strategy_name}_results.csv",
-                mime="text/csv"
-            )
-
-        with col_dl_log:
-            st.download_button(
-                label="📜 Download Full Execution Log (.txt)",
-                data=log_data,
-                file_name=f"{strategy_name}_execution.log",
-                mime="text/plain"
-            )
-
-        with col_gh:
-            if st.button("🐙 Export Results + Logs to GitHub"):
-                with st.spinner("Pushing CSV and Log files to GitHub..."):
-                    ok, res = push_results_and_logs_to_github(
-                        csv_content=csv_data,
-                        log_content=log_data,
-                        strategy_name=strategy_name,
-                        pat_token=GITHUB_PAT,
-                        repo_name=GITHUB_REPO,
-                        branch=GITHUB_BRANCH
-                    )
-                    if ok:
-                        st.success(f"✅ GitHub Commit Successful: {res}")
-                    else:
-                        st.error(f"❌ GitHub Commit Failed: {res}")
-
-    except Exception as e:
-        st.error(f"🚨 Critical Error: {e}")
-        st.code(traceback.format_exc(), language="python")
+        with col1:
+            st.download_button("📥 Download Locally", csv_buffer, export_filename, "text/csv")
+        with col2:
+            with st.spinner("Archiving to GitHub output folder..."):
+                success, path = push_csv_to_github(csv_buffer, strategy_name, github_pat, github_repo, github_branch)
+                if success:
+                    st.success(f"✅ Committed to `{path}`!")
+                else:
+                    st.error("❌ GitHub Commit failed.")
