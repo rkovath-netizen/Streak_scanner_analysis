@@ -1,52 +1,60 @@
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
 UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 UPSTOX_HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
 
-_INSTRUMENT_MAP_CACHE = None
+_INSTRUMENT_DF_CACHE = None
 
-def get_instrument_map():
-    """Downloads and caches Upstox instrument master to map symbols to instrument keys."""
-    global _INSTRUMENT_MAP_CACHE
-    if _INSTRUMENT_MAP_CACHE is not None:
-        return _INSTRUMENT_MAP_CACHE
-
+def load_upstox_master():
+    """Loads and caches the complete Upstox instrument master for Option mapping."""
+    global _INSTRUMENT_DF_CACHE
+    if _INSTRUMENT_DF_CACHE is not None:
+        return _INSTRUMENT_DF_CACHE
+    
     try:
         df = pd.read_csv(UPSTOX_INSTRUMENT_URL, compression='gzip')
-        # Filter for NSE Equities
-        nse_df = df[(df['exchange'] == 'NSE_EQ') & (df['instrument_type'] == 'EQUITY')]
-        
-        # Create a dictionary mapping trading_symbol to instrument_key
-        _INSTRUMENT_MAP_CACHE = dict(zip(nse_df['tradingsymbol'], nse_df['instrument_key']))
-        return _INSTRUMENT_MAP_CACHE
+        df = df[df['exchange'] == 'NSE_FO']
+        df['expiry'] = pd.to_datetime(df['expiry'], format="%Y-%m-%d", errors='coerce')
+        _INSTRUMENT_DF_CACHE = df
+        return df
     except Exception as e:
-        print(f"[ERROR] Failed to load Upstox instrument master: {e}")
-        return {}
-
-def fetch_upstox_intraday_candles(symbol, start_dt, end_dt, access_token, interval="15minute"):
-    """
-    Fetches historical candle data from Upstox API v2.
-    
-    Parameters:
-        symbol (str): Clean stock symbol (e.g., 'WAAREEENER', 'RELIANCE')
-        start_dt (datetime): Start datetime
-        end_dt (datetime): End datetime
-        access_token (str): Upstox access token
-        interval (str): Candle timeframe ('15minute', '1minute', 'day')
-    """
-    instrument_map = get_instrument_map()
-    
-    # Strip prefixes if any
-    clean_sym = symbol.replace("NSE:", "").replace("BSE:", "").strip()
-    instrument_key = instrument_map.get(clean_sym)
-    
-    if not instrument_key:
-        print(f"[WARNING] Symbol '{clean_sym}' not found in Upstox instrument map.")
+        print(f"[ERROR] Failed to load instrument master: {e}")
         return pd.DataFrame()
 
+def get_atm_option_instrument(cash_symbol, signal_time, cash_ltp, opt_type="CE"):
+    """
+    Finds the nearest ATM Monthly stock option contract.
+    """
+    df = load_upstox_master()
+    if df.empty: return None, None
+    
+    clean_sym = cash_symbol.replace("NSE:", "").replace("BSE:", "").strip()
+    signal_date = pd.to_datetime(signal_time).date()
+    
+    opts = df[(df['name'] == clean_sym) & (df['instrument_type'] == 'OPTSTK') & (df['option_type'] == opt_type)]
+    
+    if opts.empty:
+        return None, None
+
+    # Find the nearest Monthly Expiry Date ON or AFTER the signal date
+    future_expiries = opts[opts['expiry'].dt.date >= signal_date]
+    if future_expiries.empty:
+        return None, None
+        
+    nearest_expiry = future_expiries['expiry'].min()
+    current_expiry_opts = future_expiries[future_expiries['expiry'] == nearest_expiry].copy()
+    
+    # Calculate ATM (Closest strike to cash LTP)
+    current_expiry_opts.loc[:, 'strike_diff'] = abs(current_expiry_opts['strike'] - float(cash_ltp))
+    atm_row = current_expiry_opts.sort_values(by='strike_diff').iloc[0]
+    
+    return atm_row['instrument_key'], atm_row['tradingsymbol']
+
+def fetch_upstox_intraday_candles(instrument_key, start_dt, end_dt, access_token, interval="15minute"):
+    """Fetches intraday historical option data from Upstox API v2."""
     to_date_str = end_dt.strftime("%Y-%m-%d")
     from_date_str = start_dt.strftime("%Y-%m-%d")
 
@@ -57,37 +65,22 @@ def fetch_upstox_intraday_candles(symbol, start_dt, end_dt, access_token, interv
         from_date=from_date_str
     )
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {access_token}"
-    }
-
-    print(f"[DEBUG] Fetching Upstox candles for {clean_sym} ({from_date_str} to {to_date_str})...")
-
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+    
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
             candles = data.get("data", {}).get("candles", [])
-            
-            if not candles:
-                print(f"[WARNING] No candle data returned for {clean_sym}.")
-                return pd.DataFrame()
+            if not candles: return pd.DataFrame()
 
-            # Upstox candle schema: [timestamp, open, high, low, close, volume, open_interest]
             df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
             df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            # Convert to IST timezone
             ist = pytz.timezone("Asia/Kolkata")
             df['timestamp'] = df['timestamp'].dt.tz_convert(ist).dt.tz_localize(None)
-            
             df = df.sort_values("timestamp").reset_index(drop=True)
             return df
-        else:
-            print(f"[ERROR] Upstox API Error ({response.status_code}): {response.text}")
-            return pd.DataFrame()
-
     except Exception as e:
-        print(f"[ERROR] Exception during Upstox fetch for {clean_sym}: {e}")
-        return pd.DataFrame()
+        print(f"[ERROR] Fetch failed: {e}")
+        
+    return pd.DataFrame()
