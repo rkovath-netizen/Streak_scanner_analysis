@@ -14,22 +14,35 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
     
     for f in csv_files:
         try:
-            log_func(f"📄 Reading file: {f.name} (Size: {f.size} bytes)")
+            if hasattr(f, 'name'):
+                log_func(f"📄 Reading input: {f.name}")
+            else:
+                log_func("📄 Reading pasted input data...")
+                
             df = pd.read_csv(f)
+            
+            # --- THE MAGIC FIX FOR MULTIPLE PASTED FILES ---
+            # This drops any accidental header rows pasted in the middle of the data
+            df = df[df['seg_sym'].astype(str).str.strip() != 'seg_sym']
+            
             if not df.empty and 'seg_sym' in df.columns and 'time' in df.columns:
                 all_signals.append(df)
-                log_func(f"✅ Loaded {len(df)} signal rows from {f.name}")
+                log_func(f"✅ Loaded {len(df)} valid signal rows.")
             else:
-                log_func(f"⚠️ Skipped {f.name}: Missing 'seg_sym' or 'time' columns.")
+                log_func("⚠️ Skipped: Missing 'seg_sym' or 'time' columns.")
         except Exception as e:
-            log_func(f"❌ Error parsing {f.name}: {e}")
+            log_func(f"❌ Error parsing input: {e}")
 
     if not all_signals:
-        log_func("❌ No valid signals found across uploaded CSV files.")
+        log_func("❌ No valid signals found across inputs.")
         return pd.DataFrame()
 
     combined_df = pd.concat(all_signals, ignore_index=True)
-    combined_df['time'] = pd.to_datetime(combined_df['time'])
+    
+    # Ensure time column formats cleanly, filtering out any corrupt dates
+    combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
+    combined_df = combined_df.dropna(subset=['time'])
+    
     trade_results = []
     total_trades = len(combined_df)
     
@@ -46,7 +59,7 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
     log_func(f"🚀 Starting backtest processing for {total_trades} trade signals...")
 
     for idx, row in combined_df.iterrows():
-        raw_symbol = row['seg_sym']
+        raw_symbol = str(row['seg_sym'])
         entry_time = row['time']
         entry_price = float(row['ltp'])
         clean_symbol = raw_symbol.replace("NSE:", "").replace("BSE:", "").strip()
