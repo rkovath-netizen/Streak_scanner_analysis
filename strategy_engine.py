@@ -3,7 +3,6 @@ from datetime import timedelta
 from upstox_data import fetch_upstox_intraday_candles, get_nfo_lot_size, get_option_legs
 
 def get_premium_at_time(df, target_time, use_open=False):
-    """Gets the option price at the exact exit time, handling missing illiquid candles gracefully."""
     past_candles = df[df['timestamp'] <= target_time]
     if not past_candles.empty:
         return past_candles.iloc[-1]['open'] if use_open else past_candles.iloc[-1]['close']
@@ -22,7 +21,6 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
 
     combined_df = pd.concat(all_signals, ignore_index=True)
     combined_df['time'] = pd.to_datetime(combined_df['time'])
-    
     trade_results = []
     total_trades = len(combined_df)
 
@@ -36,8 +34,10 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
         if progress_callback:
             progress_callback(idx + 1, total_trades, f"Processing {clean_symbol} at {entry_time}")
 
-        # Direction mapping based on strategy
-        is_bullish = strategy_type in ["Long Equity", "Options: Long Straddle", "Options: Bull Put Spread (ATM & OTM1)", "Options: Bull Put Spread (ATM & OTM2)"]
+        is_bullish = strategy_type in [
+            "Long Equity", "Options: Long Straddle", "Options: Naked Call Buy",
+            "Options: Bull Put Spread (ATM & OTM1)", "Options: Bull Put Spread (ATM & OTM2)"
+        ]
         
         target_price = entry_price * (1 + tp_pct) if is_bullish else entry_price * (1 - tp_pct)
         sl_price = entry_price * (1 - sl_pct) if is_bullish else entry_price * (1 + sl_pct)
@@ -60,7 +60,6 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
         exit_time, exit_reason, is_gap_exit = None, None, False
         unique_days = []
 
-        # 1. Simulate Underlying to find Exit Time (Max 5 days)
         for i, candle in candles_df.iterrows():
             c_time, c_date = candle['timestamp'], candle['timestamp'].date()
             open_p, high_p, low_p = candle['open'], candle['high'], candle['low']
@@ -68,7 +67,6 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
             if c_date not in unique_days:
                 unique_days.append(c_date)
                 if len(unique_days) > 1:
-                    # Gap checks
                     if is_bullish:
                         if open_p >= target_price:
                             exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
@@ -83,7 +81,6 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
             if len(unique_days) > max_hold_days:
                 exit_time, exit_reason, is_gap_exit = c_time, f"Time Exit ({max_hold_days} Days)", True; break
 
-            # Intraday checks
             if is_bullish:
                 if high_p >= target_price:
                     exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
@@ -100,28 +97,25 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
             exit_reason = "Data Ended"
             is_gap_exit = False
 
-        # 2. Calculate PnL based on Strategy
         pnl_abs = 0.0
         details = ""
 
-        if strategy_type == "Long Equity":
+        if strategy_type in ["Long Equity", "Short Equity"]:
             underlying_exit = candles_df[candles_df['timestamp'] == exit_time].iloc[0]
             exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
-            pnl_abs = (exit_price - entry_price) * lot_size
+            
+            if strategy_type == "Long Equity":
+                pnl_abs = (exit_price - entry_price) * lot_size
+            else:
+                pnl_abs = (entry_price - exit_price) * lot_size
+                
             details = f"Entry: {entry_price}, Exit: {exit_price}"
             pnl_pct = (pnl_abs / (entry_price * lot_size)) * 100
 
-        elif strategy_type == "Short Equity":
-            underlying_exit = candles_df[candles_df['timestamp'] == exit_time].iloc[0]
-            exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
-            pnl_abs = (entry_price - exit_price) * lot_size
-            details = f"Entry: {entry_price}, Exit: {exit_price}"
-            pnl_pct = (pnl_abs / (entry_price * lot_size)) * 100
-
-        else: # OPTIONS STRATEGIES
+        else:
             legs = get_option_legs(clean_symbol, entry_time, entry_price, strategy_type)
             if not legs:
-                continue # Skip if option chain missing
+                continue 
                 
             total_premium_involved = 0.0
             
@@ -135,7 +129,6 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
                 leg_entry = get_premium_at_time(leg_df, entry_time, use_open=False)
                 leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
                 
-                # Formula: (Exit - Entry) * Direction * Lot Size
                 leg_pnl = (leg_exit - leg_entry) * leg['side'] * lot_size
                 pnl_abs += leg_pnl
                 
