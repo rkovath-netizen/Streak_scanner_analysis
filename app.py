@@ -16,7 +16,13 @@ setup_direction = st.sidebar.selectbox("Scanner Direction (Spot Exit Logic)", ["
 
 tp_pct = st.sidebar.number_input("Underlying Target Profit (%)", min_value=0.5, value=5.0, step=0.5) / 100.0
 sl_pct = st.sidebar.number_input("Underlying Stop Loss (%)", min_value=0.5, value=3.0, step=0.5) / 100.0
-max_hold_days = st.sidebar.number_input("Max Holding Days", min_value=1, value=5, step=1)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### ⏱️ Holding Timeframe Comparison")
+st.sidebar.info("The engine calculates PnL for both limits side-by-side.")
+primary_hold_days = st.sidebar.number_input("Primary Max Hold Days", min_value=1, value=5, step=1)
+secondary_hold_days = st.sidebar.number_input("Secondary Max Hold Days", min_value=1, value=2, step=1)
+st.sidebar.markdown("---")
 
 upstox_token = st.secrets.get("UPSTOX_ACCESS_TOKEN", None)
 github_pat = st.secrets.get("GITHUB_PAT", None)
@@ -53,7 +59,7 @@ run_backtest = False
 
 with tab1:
     st.markdown("### Step 1: Upload Files")
-    st.info("💡 **Mobile Limits:** Please select a maximum of 7 files per run to avoid Android browser timeouts.")
+    st.info("💡 **Mobile Limits:** You can batch upload 7 files at a time to prevent Android disconnects.")
     uploaded_files = st.file_uploader("Upload Streak CSVs", accept_multiple_files=True)
     
     if uploaded_files:
@@ -94,7 +100,9 @@ if run_backtest:
         trades_df = process_streak_comparative_batch(
             csv_files=files_to_process, upstox_token=upstox_token,
             setup_direction=setup_direction, tp_pct=tp_pct, sl_pct=sl_pct,
-            max_hold_days=max_hold_days, progress_callback=update_progress,
+            primary_hold_days=primary_hold_days, 
+            secondary_hold_days=secondary_hold_days,
+            progress_callback=update_progress,
             log_func=ui_log
         )
 
@@ -105,7 +113,7 @@ if run_backtest:
             
             comparison_df = generate_comparison_metrics(trades_df)
 
-            st.subheader("📊 Strategy Performance Comparison")
+            st.subheader("📊 Strategy Performance Comparison (Multi-Timeframe)")
             st.dataframe(comparison_df, use_container_width=True)
 
             st.subheader("📄 Detailed Trade Log")
