@@ -8,7 +8,6 @@ UPSTOX_HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle/{instrument
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_instrument_df():
-    """Downloads and caches the full Upstox Instrument Master for 1 hour."""
     try:
         df = pd.read_csv(UPSTOX_INSTRUMENT_URL, compression='gzip')
         df = df[df['exchange'].isin(['NSE_EQ', 'NSE_FO'])]
@@ -20,11 +19,9 @@ def get_instrument_df():
 
 def get_nfo_lot_size(symbol):
     df = get_instrument_df()
-    if df.empty:
-        return 1
+    if df.empty: return 1
     derivatives = df[(df['name'] == symbol) & (df['exchange'] == 'NSE_FO')]
-    if not derivatives.empty:
-        return int(derivatives.iloc[0]['lot_size'])
+    if not derivatives.empty: return int(derivatives.iloc[0]['lot_size'])
     return 1 
 
 def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="15minute", is_key=False, log_func=print):
@@ -67,20 +64,16 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
 
 def get_option_legs(symbol, entry_time, entry_price, strategy):
     df = get_instrument_df()
-    if df.empty:
-        return []
+    if df.empty: return []
     opts = df[(df['name'] == symbol) & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX']))].copy()
-    if opts.empty:
-        return []
+    if opts.empty: return []
     
     future_opts = opts[opts['expiry'].dt.date >= entry_time.date()]
-    if future_opts.empty:
-        return []
+    if future_opts.empty: return []
     current_chain = future_opts[future_opts['expiry'] == future_opts['expiry'].min()]
 
     unique_strikes = sorted(current_chain['strike'].unique())
-    if not unique_strikes:
-        return []
+    if not unique_strikes: return []
     closest_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - entry_price))
     
     try:
@@ -97,24 +90,18 @@ def get_option_legs(symbol, entry_time, entry_price, strategy):
         return leg.iloc[0]['instrument_key'] if not leg.empty else None
 
     legs = []
-    if strategy == "Options: Naked Call Buy":
-        legs.append({'key': get_key(atm, 'CE'), 'side': 1})
-    elif strategy == "Options: Naked Put Buy":
-        legs.append({'key': get_key(atm, 'PE'), 'side': 1})
+    if strategy == "Options: Naked Call Buy": legs.append({'key': get_key(atm, 'CE'), 'side': 1})
+    elif strategy == "Options: Naked Put Buy": legs.append({'key': get_key(atm, 'PE'), 'side': 1})
     elif strategy == "Options: Long Straddle":
         legs.append({'key': get_key(atm, 'CE'), 'side': 1})
         legs.append({'key': get_key(atm, 'PE'), 'side': 1})
     elif strategy == "Options: Bull Put Spread (ATM & OTM1)":
-        legs.append({'key': get_key(atm, 'PE'), 'side': -1})
-        legs.append({'key': get_key(otm1_pe, 'PE'), 'side': 1})
+        legs.append({'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'key': get_key(otm1_pe, 'PE'), 'side': 1})
     elif strategy == "Options: Bull Put Spread (ATM & OTM2)":
-        legs.append({'key': get_key(atm, 'PE'), 'side': -1})
-        legs.append({'key': get_key(otm2_pe, 'PE'), 'side': 1})
+        legs.append({'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'key': get_key(otm2_pe, 'PE'), 'side': 1})
     elif strategy == "Options: Bear Call Spread (ATM & OTM1)":
-        legs.append({'key': get_key(atm, 'CE'), 'side': -1})
-        legs.append({'key': get_key(otm1_ce, 'CE'), 'side': 1})
+        legs.append({'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'key': get_key(otm1_ce, 'CE'), 'side': 1})
     elif strategy == "Options: Bear Call Spread (ATM & OTM2)":
-        legs.append({'key': get_key(atm, 'CE'), 'side': -1})
-        legs.append({'key': get_key(otm2_ce, 'CE'), 'side': 1})
+        legs.append({'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'key': get_key(otm2_ce, 'CE'), 'side': 1})
         
     return [l for l in legs if l['key'] is not None]
