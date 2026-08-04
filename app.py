@@ -4,14 +4,14 @@ from datetime import datetime
 from strategy_engine import process_streak_comparative_batch
 from metrics_calculator import generate_comparison_metrics
 from github_utils import push_csv_to_github
+from upstox_data import get_instrument_df
 
 st.set_page_config(page_title="Multi-Strategy Options Backtester", layout="wide")
 st.title("📈 Comparative Options Hedge Backtester")
-st.markdown("Upload Streak signals to simulate and compare **Naked Options, Straddles, OTM1 Hedges, and OTM2 Hedges** side-by-side.")
 
+# Sidebar Configuration
 st.sidebar.header("⚙️ Configuration")
 strategy_name = st.sidebar.text_input("Report Name", value="15_MT_Momentum_Compare")
-
 setup_direction = st.sidebar.selectbox("Scanner Direction (Spot Exit Logic)", ["Bullish", "Bearish"])
 
 tp_pct = st.sidebar.number_input("Underlying Target Profit (%)", min_value=0.5, value=5.0, step=0.5) / 100.0
@@ -23,19 +23,48 @@ github_pat = st.secrets.get("GITHUB_PAT", None)
 github_repo = st.secrets.get("GITHUB_REPO", None)
 github_branch = st.secrets.get("GITHUB_BRANCH", "main")
 
-if not github_pat or not upstox_token:
-    st.sidebar.warning("⚠️ Missing API tokens in Streamlit secrets settings.")
+# Secrets Debug Box
+with st.sidebar.expander("🔑 Secrets Status", expanded=False):
+    st.write("Upstox Token:", "✅ Detected" if upstox_token else "❌ Missing")
+    st.write("GitHub PAT:", "✅ Detected" if github_pat else "❌ Missing")
+    st.write("GitHub Repo:", github_repo if github_repo else "❌ Missing")
 
-# Added txt and tsv extensions to fix Android mobile Chrome file-picker issues
+# Quick API Test Button
+if st.sidebar.button("🧪 Test Upstox Connection"):
+    with st.spinner("Downloading/Checking Instrument Master..."):
+        df_inst = get_instrument_df()
+        if not df_inst.empty:
+            st.sidebar.success(f"✅ Upstox Connected! Loaded {len(df_inst)} instruments.")
+        else:
+            st.sidebar.error("❌ Upstox connection failed.")
+
+# File Uploader
 uploaded_files = st.file_uploader(
     "Upload Streak CSV Scanner Exports", 
     type=["csv", "txt", "tsv"], 
     accept_multiple_files=True
 )
 
+# File Upload Diagnostics Container
+if uploaded_files:
+    st.success(f"📁 {len(uploaded_files)} File(s) Detected in Upload State:")
+    for idx, f in enumerate(uploaded_files):
+        st.write(f"• **File {idx+1}:** `{f.name}` | **Size:** `{f.size} bytes` | **Type:** `{f.type}`")
+
+# Debug Console Container
+log_expander = st.expander("🛠️ Real-Time Debug & Execution Logs", expanded=True)
+log_box = log_expander.empty()
+log_messages = []
+
+def ui_log(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    log_messages.append(formatted_msg)
+    log_box.code("\n".join(log_messages[-25:]), language="text") # Show last 25 logs
+
 if uploaded_files and st.button("🚀 Run Comparative Backtest"):
     if not upstox_token:
-        st.error("Cannot proceed: UPSTOX_ACCESS_TOKEN is not set.")
+        st.error("Cannot proceed: UPSTOX_ACCESS_TOKEN is missing from Secrets.")
     else:
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -44,15 +73,17 @@ if uploaded_files and st.button("🚀 Run Comparative Backtest"):
             progress_bar.progress(int((current / total) * 100))
             status_text.text(f"[{current}/{total}] {message}")
 
-        with st.spinner("Fetching Spot & Option Chains. Simulating all hedges..."):
-            trades_df = process_streak_comparative_batch(
-                csv_files=uploaded_files, upstox_token=upstox_token,
-                setup_direction=setup_direction, tp_pct=tp_pct, sl_pct=sl_pct,
-                max_hold_days=max_hold_days, progress_callback=update_progress
-            )
+        ui_log("Starting backtest run...")
+        
+        trades_df = process_streak_comparative_batch(
+            csv_files=uploaded_files, upstox_token=upstox_token,
+            setup_direction=setup_direction, tp_pct=tp_pct, sl_pct=sl_pct,
+            max_hold_days=max_hold_days, progress_callback=update_progress,
+            log_func=ui_log
+        )
 
         if trades_df.empty:
-            st.error("No valid trades executed or files could not be read. Ensure CSV files contain 'seg_sym' and 'time' columns.")
+            st.error("❌ No valid trades executed. Check the Debug Logs above to see why files or candles were skipped.")
         else:
             st.success("✅ Comparative Backtest Complete!")
             
