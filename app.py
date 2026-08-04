@@ -1,114 +1,107 @@
-import streamlit as st
+import requests
 import pandas as pd
-from datetime import datetime
-from strategy_engine import process_streak_comparative_batch
-from metrics_calculator import generate_comparison_metrics
-from github_utils import push_csv_to_github
-from upstox_data import get_instrument_df
+import pytz
+import streamlit as st
 
-st.set_page_config(page_title="Multi-Strategy Options Backtester", layout="wide")
-st.title("📈 Comparative Options Hedge Backtester")
+UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+UPSTOX_HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
 
-# Sidebar Configuration
-st.sidebar.header("⚙️ Configuration")
-strategy_name = st.sidebar.text_input("Report Name", value="15_MT_Momentum_Compare")
-setup_direction = st.sidebar.selectbox("Scanner Direction (Spot Exit Logic)", ["Bullish", "Bearish"])
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_instrument_df():
+    try:
+        df = pd.read_csv(UPSTOX_INSTRUMENT_URL, compression='gzip')
+        df = df[df['exchange'].isin(['NSE_EQ', 'NSE_FO'])]
+        df['expiry'] = pd.to_datetime(df['expiry'], errors='coerce')
+        return df
+    except Exception as e:
+        st.error(f"❌ Failed to download Upstox Instrument Master: {e}")
+        return pd.DataFrame()
 
-tp_pct = st.sidebar.number_input("Underlying Target Profit (%)", min_value=0.5, value=5.0, step=0.5) / 100.0
-sl_pct = st.sidebar.number_input("Underlying Stop Loss (%)", min_value=0.5, value=3.0, step=0.5) / 100.0
-max_hold_days = st.sidebar.number_input("Max Holding Days", min_value=1, value=5, step=1)
+def get_nfo_lot_size(symbol):
+    df = get_instrument_df()
+    if df.empty: return 1
+    derivatives = df[(df['name'] == symbol) & (df['exchange'] == 'NSE_FO')]
+    if not derivatives.empty: return int(derivatives.iloc[0]['lot_size'])
+    return 1 
 
-upstox_token = st.secrets.get("UPSTOX_ACCESS_TOKEN", None)
-github_pat = st.secrets.get("GITHUB_PAT", None)
-github_repo = st.secrets.get("GITHUB_REPO", None)
-github_branch = st.secrets.get("GITHUB_BRANCH", "main")
+def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="15minute", is_key=False, log_func=print):
+    df_inst = get_instrument_df()
+    if df_inst.empty:
+        log_func("⚠️ Instrument master is empty.")
+        return pd.DataFrame()
 
-# Secrets Debug Box
-with st.sidebar.expander("🔑 Secrets Status", expanded=False):
-    st.write("Upstox Token:", "✅ Detected" if upstox_token else "❌ Missing")
-    st.write("GitHub PAT:", "✅ Detected" if github_pat else "❌ Missing")
-    st.write("GitHub Repo:", github_repo if github_repo else "❌ Missing")
-
-# Quick API Test Button
-if st.sidebar.button("🧪 Test Upstox Connection"):
-    with st.spinner("Downloading/Checking Instrument Master..."):
-        df_inst = get_instrument_df()
-        if not df_inst.empty:
-            st.sidebar.success(f"✅ Upstox Connected! Loaded {len(df_inst)} instruments.")
-        else:
-            st.sidebar.error("❌ Upstox connection failed.")
-
-# File Uploader
-uploaded_files = st.file_uploader(
-    "Upload Streak CSV Scanner Exports", 
-    type=["csv", "txt", "tsv"], 
-    accept_multiple_files=True
-)
-
-# File Upload Diagnostics Container
-if uploaded_files:
-    st.success(f"📁 {len(uploaded_files)} File(s) Detected in Upload State:")
-    for idx, f in enumerate(uploaded_files):
-        st.write(f"• **File {idx+1}:** `{f.name}` | **Size:** `{f.size} bytes` | **Type:** `{f.type}`")
-
-# Debug Console Container
-log_expander = st.expander("🛠️ Real-Time Debug & Execution Logs", expanded=True)
-log_box = log_expander.empty()
-log_messages = []
-
-def ui_log(msg):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    formatted_msg = f"[{timestamp}] {msg}"
-    log_messages.append(formatted_msg)
-    log_box.code("\n".join(log_messages[-25:]), language="text") # Show last 25 logs
-
-if uploaded_files and st.button("🚀 Run Comparative Backtest"):
-    if not upstox_token:
-        st.error("Cannot proceed: UPSTOX_ACCESS_TOKEN is missing from Secrets.")
+    if not is_key:
+        clean_sym = symbol_or_key.replace("NSE:", "").replace("BSE:", "").strip()
+        eq_rows = df_inst[(df_inst['tradingsymbol'] == clean_sym) & (df_inst['exchange'] == 'NSE_EQ')]
+        if eq_rows.empty:
+            log_func(f"⚠️ Symbol '{clean_sym}' not found in Upstox Master.")
+            return pd.DataFrame()
+        instrument_key = eq_rows.iloc[0]['instrument_key']
     else:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        instrument_key = symbol_or_key
 
-        def update_progress(current, total, message):
-            progress_bar.progress(int((current / total) * 100))
-            status_text.text(f"[{current}/{total}] {message}")
-
-        ui_log("Starting backtest run...")
-        
-        trades_df = process_streak_comparative_batch(
-            csv_files=uploaded_files, upstox_token=upstox_token,
-            setup_direction=setup_direction, tp_pct=tp_pct, sl_pct=sl_pct,
-            max_hold_days=max_hold_days, progress_callback=update_progress,
-            log_func=ui_log
-        )
-
-        if trades_df.empty:
-            st.error("❌ No valid trades executed. Check the Debug Logs above to see why files or candles were skipped.")
+    url = UPSTOX_HISTORICAL_URL.format(
+        instrument_key=instrument_key, unit=interval,
+        to_date=end_dt.strftime("%Y-%m-%d"), from_date=start_dt.strftime("%Y-%m-%d")
+    )
+    try:
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            candles = response.json().get("data", {}).get("candles", [])
+            if not candles:
+                log_func(f"⚠️ No candles returned for key {instrument_key}")
+                return pd.DataFrame()
+            df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(pytz.timezone("Asia/Kolkata")).dt.tz_localize(None)
+            return df.sort_values("timestamp").reset_index(drop=True)
         else:
-            st.success("✅ Comparative Backtest Complete!")
-            
-            comparison_df = generate_comparison_metrics(trades_df)
+            log_func(f"❌ Upstox API Error HTTP {response.status_code}: {response.text}")
+            return pd.DataFrame()
+    except Exception as e:
+        log_func(f"❌ Exception fetching candles: {e}")
+        return pd.DataFrame()
 
-            st.subheader("📊 Strategy Performance Comparison (All Variants)")
-            st.dataframe(comparison_df, use_container_width=True)
+def get_option_legs(symbol, entry_time, entry_price, strategy):
+    df = get_instrument_df()
+    if df.empty: return []
+    opts = df[(df['name'] == symbol) & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX']))].copy()
+    if opts.empty: return []
+    
+    future_opts = opts[opts['expiry'].dt.date >= entry_time.date()]
+    if future_opts.empty: return []
+    current_chain = future_opts[future_opts['expiry'] == future_opts['expiry'].min()]
 
-            st.subheader("📄 Detailed Trade Log (Side-by-Side PnL)")
-            st.dataframe(trades_df, use_container_width=True)
+    unique_strikes = sorted(current_chain['strike'].unique())
+    if not unique_strikes: return []
+    closest_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - entry_price))
+    
+    try:
+        atm = unique_strikes[closest_idx]
+        otm1_pe = unique_strikes[max(0, closest_idx - 1)]
+        otm2_pe = unique_strikes[max(0, closest_idx - 2)]
+        otm1_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 1)]
+        otm2_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 2)]
+    except IndexError:
+        return [] 
 
-            csv_buffer = trades_df.to_csv(index=False)
-            st.markdown("---")
-            col1, col2 = st.columns(2)
-            
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            export_filename = f"{strategy_name.lower()}_{timestamp_str}.csv"
+    def get_key(s, opt_type):
+        leg = current_chain[(current_chain['strike'] == s) & (current_chain['instrument_type'] == opt_type)]
+        return leg.iloc[0]['instrument_key'] if not leg.empty else None
 
-            with col1:
-                st.download_button("📥 Download Full CSV", csv_buffer, export_filename, "text/csv")
-            with col2:
-                if github_pat and github_repo:
-                    with st.spinner("Archiving comparative report to GitHub `output/`..."):
-                        success, path = push_csv_to_github(csv_buffer, strategy_name, github_pat, github_repo, github_branch)
-                        if success:
-                            st.success(f"✅ Auto-Committed to `{path}`!")
-                        else:
-                            st.error("❌ GitHub Commit failed.")
+    legs = []
+    if strategy == "Options: Naked Call Buy": legs.append({'key': get_key(atm, 'CE'), 'side': 1})
+    elif strategy == "Options: Naked Put Buy": legs.append({'key': get_key(atm, 'PE'), 'side': 1})
+    elif strategy == "Options: Long Straddle":
+        legs.append({'key': get_key(atm, 'CE'), 'side': 1})
+        legs.append({'key': get_key(atm, 'PE'), 'side': 1})
+    elif strategy == "Options: Bull Put Spread (ATM & OTM1)":
+        legs.append({'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'key': get_key(otm1_pe, 'PE'), 'side': 1})
+    elif strategy == "Options: Bull Put Spread (ATM & OTM2)":
+        legs.append({'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'key': get_key(otm2_pe, 'PE'), 'side': 1})
+    elif strategy == "Options: Bear Call Spread (ATM & OTM1)":
+        legs.append({'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'key': get_key(otm1_ce, 'CE'), 'side': 1})
+    elif strategy == "Options: Bear Call Spread (ATM & OTM2)":
+        legs.append({'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'key': get_key(otm2_ce, 'CE'), 'side': 1})
+        
+    return [l for l in legs if l['key'] is not None]
