@@ -7,12 +7,11 @@ from github_utils import push_csv_to_github
 
 st.set_page_config(page_title="Multi-Strategy Options Backtester", layout="wide")
 st.title("📈 Comparative Options Hedge Backtester")
-st.markdown("Upload Streak signals to instantly simulate and compare **Naked Options, Straddles, OTM1 Hedges, and OTM2 Hedges** side-by-side.")
+st.markdown("Upload Streak signals to simulate and compare **Naked Options, Straddles, OTM1 Hedges, and OTM2 Hedges** side-by-side.")
 
 st.sidebar.header("⚙️ Configuration")
 strategy_name = st.sidebar.text_input("Report Name", value="15_MT_Momentum_Compare")
 
-# The Setup Direction determines if the Spot Asset looks for +5% target (Bullish) or -5% target (Bearish)
 setup_direction = st.sidebar.selectbox("Scanner Direction (Spot Exit Logic)", ["Bullish", "Bearish"])
 
 tp_pct = st.sidebar.number_input("Underlying Target Profit (%)", min_value=0.5, value=5.0, step=0.5) / 100.0
@@ -27,7 +26,12 @@ github_branch = st.secrets.get("GITHUB_BRANCH", "main")
 if not github_pat or not upstox_token:
     st.sidebar.warning("⚠️ Missing API tokens in Streamlit secrets settings.")
 
-uploaded_files = st.file_uploader("Upload Streak CSV Scanner Exports", type=["csv"], accept_multiple_files=True)
+# Added txt and tsv extensions to fix Android mobile Chrome file-picker issues
+uploaded_files = st.file_uploader(
+    "Upload Streak CSV Scanner Exports", 
+    type=["csv", "txt", "tsv"], 
+    accept_multiple_files=True
+)
 
 if uploaded_files and st.button("🚀 Run Comparative Backtest"):
     if not upstox_token:
@@ -48,11 +52,10 @@ if uploaded_files and st.button("🚀 Run Comparative Backtest"):
             )
 
         if trades_df.empty:
-            st.error("No trades executed or market data missing.")
+            st.error("No valid trades executed or files could not be read. Ensure CSV files contain 'seg_sym' and 'time' columns.")
         else:
             st.success("✅ Comparative Backtest Complete!")
             
-            # Generate Comparison Table
             comparison_df = generate_comparison_metrics(trades_df)
 
             st.subheader("📊 Strategy Performance Comparison (All Variants)")
