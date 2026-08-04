@@ -1,10 +1,6 @@
 import pandas as pd
 
 def generate_comparison_metrics(trades_df):
-    """
-    Parses the massive comparative trades_df and creates a clean summary table 
-    ranking all strategies by their overall performance metrics.
-    """
     if trades_df.empty:
         return pd.DataFrame()
 
@@ -22,29 +18,27 @@ def generate_comparison_metrics(trades_df):
         abs_col = f"{strat} PnL (₹)"
         pct_col = f"{strat} Return (%)"
         
-        # Check if this strategy exists in the dataframe
         if abs_col in trades_df.columns:
             winning_trades = (trades_df[abs_col] > 0).sum()
             win_rate = round((winning_trades / total_trades) * 100, 2) if total_trades > 0 else 0
             total_pnl = round(trades_df[abs_col].sum(), 2)
             avg_return = round(trades_df[pct_col].mean(), 2)
             
-            # Calculate Max Drawdown for this strategy
             cum_pnl = trades_df[abs_col].cumsum()
             peak = cum_pnl.cummax()
             drawdown = cum_pnl - peak
             max_dd = round(drawdown.min(), 2)
 
             metrics_list.append({
-                "Strategy": strat.replace("Options: ", ""), # Clean up names for table
+                "Strategy": strat.replace("Options: ", ""),
                 "Win Rate (%)": win_rate,
                 "Total PnL (₹)": total_pnl,
                 "Avg Return per Trade (%)": avg_return,
                 "Max Drawdown (₹)": max_dd
             })
 
-    # Convert to DataFrame and sort by Total PnL (Highest to Lowest)
     metrics_df = pd.DataFrame(metrics_list)
-    metrics_df = metrics_df.sort_values(by="Total PnL (₹)", ascending=False).reset_index(drop=True)
+    if not metrics_df.empty:
+        metrics_df = metrics_df.sort_values(by="Total PnL (₹)", ascending=False).reset_index(drop=True)
     
     return metrics_df
