@@ -1,19 +1,16 @@
 import pandas as pd
 
 def generate_comparison_metrics(trades_df):
-    if trades_df.empty:
-        return pd.DataFrame()
-
+    if trades_df.empty: return pd.DataFrame()
     strategies = [
         "Long Equity", "Short Equity", 
         "Options: Naked Call Buy", "Options: Naked Put Buy", "Options: Long Straddle", 
         "Options: Bull Put Spread (ATM & OTM1)", "Options: Bull Put Spread (ATM & OTM2)",
         "Options: Bear Call Spread (ATM & OTM1)", "Options: Bear Call Spread (ATM & OTM2)"
     ]
-
     metrics_list = []
     total_trades = len(trades_df)
-
+    
     for strat in strategies:
         abs_col = f"{strat} PnL (₹)"
         pct_col = f"{strat} Return (%)"
@@ -40,5 +37,4 @@ def generate_comparison_metrics(trades_df):
     metrics_df = pd.DataFrame(metrics_list)
     if not metrics_df.empty:
         metrics_df = metrics_df.sort_values(by="Total PnL (₹)", ascending=False).reset_index(drop=True)
-    
     return metrics_df
