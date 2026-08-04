@@ -3,26 +3,31 @@ from datetime import timedelta
 from upstox_data import fetch_upstox_intraday_candles, get_nfo_lot_size, get_option_legs
 
 def get_premium_at_time(df, target_time, use_open=False):
-    past_candles = df[df['timestamp'] <= target_time]
-    if not past_candles.empty:
-        return past_candles.iloc[-1]['open'] if use_open else past_candles.iloc[-1]['close']
-    future_candles = df[df['timestamp'] >= target_time]
-    if not future_candles.empty:
-        return future_candles.iloc[0]['open']
+    past = df[df['timestamp'] <= target_time]
+    if not past.empty: return past.iloc[-1]['open'] if use_open else past.iloc[-1]['close']
+    future = df[df['timestamp'] >= target_time]
+    if not future.empty: return future.iloc[0]['open']
     return 0.0
 
-def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct, max_hold_days, progress_callback=None):
-    all_signals = []
-    for file in csv_files:
-        all_signals.append(pd.read_csv(file))
-        
-    if not all_signals:
-        return pd.DataFrame()
+def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, tp_pct, sl_pct, max_hold_days, progress_callback=None):
+    all_signals = [pd.read_csv(f) for f in csv_files] if csv_files else []
+    if not all_signals: return pd.DataFrame()
 
     combined_df = pd.concat(all_signals, ignore_index=True)
     combined_df['time'] = pd.to_datetime(combined_df['time'])
     trade_results = []
     total_trades = len(combined_df)
+    
+    # Cache dictionary to prevent duplicate API calls for the same Option leg
+    api_cache = {}
+
+    is_bullish = (setup_direction == "Bullish")
+    strategies = [
+        "Long Equity", "Short Equity", 
+        "Options: Naked Call Buy", "Options: Naked Put Buy", "Options: Long Straddle", 
+        "Options: Bull Put Spread (ATM & OTM1)", "Options: Bull Put Spread (ATM & OTM2)",
+        "Options: Bear Call Spread (ATM & OTM1)", "Options: Bear Call Spread (ATM & OTM2)"
+    ]
 
     for idx, row in combined_df.iterrows():
         raw_symbol = row['seg_sym']
@@ -32,35 +37,25 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
         lot_size = get_nfo_lot_size(clean_symbol)
 
         if progress_callback:
-            progress_callback(idx + 1, total_trades, f"Processing {clean_symbol} at {entry_time}")
+            progress_callback(idx + 1, total_trades, f"Comparing strategies for {clean_symbol}...")
 
-        is_bullish = strategy_type in [
-            "Long Equity", "Options: Long Straddle", "Options: Naked Call Buy",
-            "Options: Bull Put Spread (ATM & OTM1)", "Options: Bull Put Spread (ATM & OTM2)"
-        ]
-        
         target_price = entry_price * (1 + tp_pct) if is_bullish else entry_price * (1 - tp_pct)
         sl_price = entry_price * (1 - sl_pct) if is_bullish else entry_price * (1 + sl_pct)
 
         fetch_start = entry_time
         fetch_end = entry_time + timedelta(days=10) 
 
-        candles_df = fetch_upstox_intraday_candles(
-            symbol_or_key=clean_symbol, start_dt=fetch_start, end_dt=fetch_end, 
-            access_token=upstox_token, interval="15minute", is_key=False
-        )
-
-        if candles_df.empty:
-            continue
-
-        candles_df = candles_df[candles_df['timestamp'] >= entry_time].reset_index(drop=True)
-        if candles_df.empty:
-            continue
+        # Fetch Spot Data
+        spot_df = fetch_upstox_intraday_candles(clean_symbol, fetch_start, fetch_end, upstox_token, is_key=False)
+        if spot_df.empty: continue
+        spot_df = spot_df[spot_df['timestamp'] >= entry_time].reset_index(drop=True)
+        if spot_df.empty: continue
 
         exit_time, exit_reason, is_gap_exit = None, None, False
         unique_days = []
 
-        for i, candle in candles_df.iterrows():
+        # Find Spot Exit Time
+        for i, candle in spot_df.iterrows():
             c_time, c_date = candle['timestamp'], candle['timestamp'].date()
             open_p, high_p, low_p = candle['open'], candle['high'], candle['low']
 
@@ -68,86 +63,63 @@ def process_streak_batch(csv_files, upstox_token, strategy_type, tp_pct, sl_pct,
                 unique_days.append(c_date)
                 if len(unique_days) > 1:
                     if is_bullish:
-                        if open_p >= target_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
-                        elif open_p <= sl_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
+                        if open_p >= target_price: exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
+                        elif open_p <= sl_price: exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
                     else:
-                        if open_p <= target_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
-                        elif open_p >= sl_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
+                        if open_p <= target_price: exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
+                        elif open_p >= sl_price: exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
 
             if len(unique_days) > max_hold_days:
                 exit_time, exit_reason, is_gap_exit = c_time, f"Time Exit ({max_hold_days} Days)", True; break
 
             if is_bullish:
-                if high_p >= target_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
-                elif low_p <= sl_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+                if high_p >= target_price: exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif low_p <= sl_price: exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
             else:
-                if low_p <= target_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
-                elif high_p >= sl_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+                if low_p <= target_price: exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif high_p >= sl_price: exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
 
         if not exit_time:
-            exit_time = candles_df.iloc[-1]['timestamp']
+            exit_time = spot_df.iloc[-1]['timestamp']
             exit_reason = "Data Ended"
             is_gap_exit = False
 
-        pnl_abs = 0.0
-        details = ""
+        # Create row dictionary
+        trade_data = {
+            'Symbol': clean_symbol, 'Lot Size': lot_size,
+            'Entry Time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'Exit Time': exit_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'Days Held': len(unique_days), 'Exit Reason': exit_reason
+        }
 
-        if strategy_type in ["Long Equity", "Short Equity"]:
-            underlying_exit = candles_df[candles_df['timestamp'] == exit_time].iloc[0]
-            exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
-            
-            if strategy_type == "Long Equity":
-                pnl_abs = (exit_price - entry_price) * lot_size
+        # Calculate PnL for ALL strategies side-by-side
+        for strat in strategies:
+            pnl_abs = 0.0
+            if strat in ["Long Equity", "Short Equity"]:
+                underlying_exit = spot_df[spot_df['timestamp'] == exit_time].iloc[0]
+                exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
+                pnl_abs = (exit_price - entry_price) * lot_size if strat == "Long Equity" else (entry_price - exit_price) * lot_size
             else:
-                pnl_abs = (entry_price - exit_price) * lot_size
-                
-            details = f"Entry: {entry_price}, Exit: {exit_price}"
-            pnl_pct = (pnl_abs / (entry_price * lot_size)) * 100
-
-        else:
-            legs = get_option_legs(clean_symbol, entry_time, entry_price, strategy_type)
-            if not legs:
-                continue 
-                
-            total_premium_involved = 0.0
+                legs = get_option_legs(clean_symbol, entry_time, entry_price, strat)
+                for leg in legs:
+                    # Use cache to avoid hammering API
+                    cache_key = f"{leg['key']}_{fetch_start.date()}"
+                    if cache_key not in api_cache:
+                        api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True)
+                    
+                    leg_df = api_cache[cache_key]
+                    if not leg_df.empty:
+                        leg_entry = get_premium_at_time(leg_df, entry_time, use_open=False)
+                        leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
+                        pnl_abs += (leg_exit - leg_entry) * leg['side'] * lot_size
             
-            for leg in legs:
-                leg_df = fetch_upstox_intraday_candles(
-                    leg['key'], entry_time, exit_time + timedelta(days=1), 
-                    upstox_token, is_key=True
-                )
-                if leg_df.empty: continue
-                
-                leg_entry = get_premium_at_time(leg_df, entry_time, use_open=False)
-                leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
-                
-                leg_pnl = (leg_exit - leg_entry) * leg['side'] * lot_size
-                pnl_abs += leg_pnl
-                
-                action = "Buy" if leg['side'] == 1 else "Sell"
-                details += f"[{leg['type']}: {action} @ {leg_entry:.2f}, Exit @ {leg_exit:.2f}] "
-                total_premium_involved += leg_entry * lot_size
+            # Standardize % Return by checking against total capital exposure (Underlying * Lot Size)
+            capital_exposure = entry_price * lot_size
+            pnl_pct = (pnl_abs / capital_exposure) * 100 if capital_exposure > 0 else 0
+            
+            trade_data[f"{strat} PnL (₹)"] = round(pnl_abs, 2)
+            trade_data[f"{strat} Return (%)"] = round(pnl_pct, 2)
 
-            pnl_pct = (pnl_abs / total_premium_involved) * 100 if total_premium_involved > 0 else 0
-
-        trade_results.append({
-            'symbol': clean_symbol,
-            'lot_size': lot_size,
-            'entry_time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
-            'exit_time': exit_time.strftime("%Y-%m-%d %H:%M:%S"),
-            'pnl_abs': round(pnl_abs, 2),
-            'pnl_pct': round(pnl_pct, 2),
-            'days_held': len(unique_days),
-            'exit_reason': exit_reason,
-            'trade_details': details
-        })
+        trade_results.append(trade_data)
 
     return pd.DataFrame(trade_results)
