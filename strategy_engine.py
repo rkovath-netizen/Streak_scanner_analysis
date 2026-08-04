@@ -4,11 +4,9 @@ from upstox_data import fetch_upstox_intraday_candles, get_nfo_lot_size, get_opt
 
 def get_premium_at_time(df, target_time, use_open=False):
     past = df[df['timestamp'] <= target_time]
-    if not past.empty:
-        return past.iloc[-1]['open'] if use_open else past.iloc[-1]['close']
+    if not past.empty: return past.iloc[-1]['open'] if use_open else past.iloc[-1]['close']
     future = df[df['timestamp'] >= target_time]
-    if not future.empty:
-        return future.iloc[0]['open']
+    if not future.empty: return future.iloc[0]['open']
     return 0.0
 
 def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, tp_pct, sl_pct, max_hold_days, progress_callback=None, log_func=print):
@@ -16,10 +14,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
     
     for f in csv_files:
         try:
-            log_func(f"📄 Reading uploaded file: {f.name} (Size: {f.size} bytes)")
+            log_func(f"📄 Reading file: {f.name} (Size: {f.size} bytes)")
             df = pd.read_csv(f)
-            log_func(f"📊 Columns detected: {list(df.columns)}")
-            
             if not df.empty and 'seg_sym' in df.columns and 'time' in df.columns:
                 all_signals.append(df)
                 log_func(f"✅ Loaded {len(df)} signal rows from {f.name}")
@@ -59,7 +55,7 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         if progress_callback:
             progress_callback(idx + 1, total_trades, f"Processing Trade {idx+1}/{total_trades}: {clean_symbol}")
 
-        log_func(f"🔍 Trade {idx+1}: {clean_symbol} at {entry_time} | Entry Price: {entry_price} | Lot Size: {lot_size}")
+        log_func(f"🔍 Trade {idx+1}: {clean_symbol} | Entry: {entry_price} | Lot: {lot_size}")
 
         target_price = entry_price * (1 + tp_pct) if is_bullish else entry_price * (1 - tp_pct)
         sl_price = entry_price * (1 - sl_pct) if is_bullish else entry_price * (1 + sl_pct)
@@ -69,12 +65,11 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
 
         spot_df = fetch_upstox_intraday_candles(clean_symbol, fetch_start, fetch_end, upstox_token, is_key=False, log_func=log_func)
         if spot_df.empty:
-            log_func(f"⚠️ Could not retrieve intraday spot candles for {clean_symbol}. Skipping.")
+            log_func(f"⚠️ Could not retrieve candles for {clean_symbol}. Skipping.")
             continue
             
         spot_df = spot_df[spot_df['timestamp'] >= entry_time].reset_index(drop=True)
         if spot_df.empty:
-            log_func(f"⚠️ No candles after entry time {entry_time} for {clean_symbol}.")
             continue
 
         exit_time, exit_reason, is_gap_exit = None, None, False
@@ -88,36 +83,28 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 unique_days.append(c_date)
                 if len(unique_days) > 1:
                     if is_bullish:
-                        if open_p >= target_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
-                        elif open_p <= sl_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
+                        if open_p >= target_price: exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
+                        elif open_p <= sl_price: exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
                     else:
-                        if open_p <= target_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
-                        elif open_p >= sl_price:
-                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
+                        if open_p <= target_price: exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
+                        elif open_p >= sl_price: exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
 
             if len(unique_days) > max_hold_days:
                 exit_time, exit_reason, is_gap_exit = c_time, f"Time Exit ({max_hold_days} Days)", True; break
 
             if is_bullish:
-                if high_p >= target_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
-                elif low_p <= sl_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+                if high_p >= target_price: exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif low_p <= sl_price: exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
             else:
-                if low_p <= target_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
-                elif high_p >= sl_price:
-                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+                if low_p <= target_price: exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif high_p >= sl_price: exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
 
         if not exit_time:
             exit_time = spot_df.iloc[-1]['timestamp']
             exit_reason = "Data Ended"
             is_gap_exit = False
 
-        log_func(f"🎯 Exit Triggered: {exit_time} | Reason: {exit_reason}")
+        log_func(f"🎯 Exit: {exit_time} | Reason: {exit_reason}")
 
         trade_data = {
             'Symbol': clean_symbol, 'Lot Size': lot_size,
