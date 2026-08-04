@@ -4,24 +4,37 @@ from upstox_data import fetch_upstox_intraday_candles, get_nfo_lot_size, get_opt
 
 def get_premium_at_time(df, target_time, use_open=False):
     past = df[df['timestamp'] <= target_time]
-    if not past.empty: return past.iloc[-1]['open'] if use_open else past.iloc[-1]['close']
+    if not past.empty:
+        return past.iloc[-1]['open'] if use_open else past.iloc[-1]['close']
     future = df[df['timestamp'] >= target_time]
-    if not future.empty: return future.iloc[0]['open']
+    if not future.empty:
+        return future.iloc[0]['open']
     return 0.0
 
 def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, tp_pct, sl_pct, max_hold_days, progress_callback=None):
-    all_signals = [pd.read_csv(f) for f in csv_files] if csv_files else []
-    if not all_signals: return pd.DataFrame()
+    all_signals = []
+    for f in csv_files:
+        try:
+            df = pd.read_csv(f)
+            # Mobile safeguard: Ignore empty CSVs or files missing required Streak columns
+            if not df.empty and 'seg_sym' in df.columns and 'time' in df.columns:
+                all_signals.append(df)
+            else:
+                print(f"[SKIP] Empty or invalid Streak CSV skipped.")
+        except Exception as e:
+            print(f"[SKIP] Failed to parse file: {e}")
+
+    if not all_signals:
+        return pd.DataFrame()
 
     combined_df = pd.concat(all_signals, ignore_index=True)
     combined_df['time'] = pd.to_datetime(combined_df['time'])
     trade_results = []
     total_trades = len(combined_df)
     
-    # Cache dictionary to prevent duplicate API calls for the same Option leg
     api_cache = {}
-
     is_bullish = (setup_direction == "Bullish")
+    
     strategies = [
         "Long Equity", "Short Equity", 
         "Options: Naked Call Buy", "Options: Naked Put Buy", "Options: Long Straddle", 
@@ -45,16 +58,16 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         fetch_start = entry_time
         fetch_end = entry_time + timedelta(days=10) 
 
-        # Fetch Spot Data
         spot_df = fetch_upstox_intraday_candles(clean_symbol, fetch_start, fetch_end, upstox_token, is_key=False)
-        if spot_df.empty: continue
+        if spot_df.empty:
+            continue
         spot_df = spot_df[spot_df['timestamp'] >= entry_time].reset_index(drop=True)
-        if spot_df.empty: continue
+        if spot_df.empty:
+            continue
 
         exit_time, exit_reason, is_gap_exit = None, None, False
         unique_days = []
 
-        # Find Spot Exit Time
         for i, candle in spot_df.iterrows():
             c_time, c_date = candle['timestamp'], candle['timestamp'].date()
             open_p, high_p, low_p = candle['open'], candle['high'], candle['low']
@@ -63,28 +76,35 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 unique_days.append(c_date)
                 if len(unique_days) > 1:
                     if is_bullish:
-                        if open_p >= target_price: exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
-                        elif open_p <= sl_price: exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
+                        if open_p >= target_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Up", True; break
+                        elif open_p <= sl_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Down", True; break
                     else:
-                        if open_p <= target_price: exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
-                        elif open_p >= sl_price: exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
+                        if open_p <= target_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "Target Hit on Gap-Down", True; break
+                        elif open_p >= sl_price:
+                            exit_time, exit_reason, is_gap_exit = c_time, "SL Hit on Gap-Up", True; break
 
             if len(unique_days) > max_hold_days:
                 exit_time, exit_reason, is_gap_exit = c_time, f"Time Exit ({max_hold_days} Days)", True; break
 
             if is_bullish:
-                if high_p >= target_price: exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
-                elif low_p <= sl_price: exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+                if high_p >= target_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif low_p <= sl_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
             else:
-                if low_p <= target_price: exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
-                elif high_p >= sl_price: exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
+                if low_p <= target_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"Target Hit (+{tp_pct*100:.1f}%)", False; break
+                elif high_p >= sl_price:
+                    exit_time, exit_reason, is_gap_exit = c_time, f"SL Hit (-{sl_pct*100:.1f}%)", False; break
 
         if not exit_time:
             exit_time = spot_df.iloc[-1]['timestamp']
             exit_reason = "Data Ended"
             is_gap_exit = False
 
-        # Create row dictionary
         trade_data = {
             'Symbol': clean_symbol, 'Lot Size': lot_size,
             'Entry Time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -92,7 +112,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             'Days Held': len(unique_days), 'Exit Reason': exit_reason
         }
 
-        # Calculate PnL for ALL strategies side-by-side
         for strat in strategies:
             pnl_abs = 0.0
             if strat in ["Long Equity", "Short Equity"]:
@@ -102,7 +121,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             else:
                 legs = get_option_legs(clean_symbol, entry_time, entry_price, strat)
                 for leg in legs:
-                    # Use cache to avoid hammering API
                     cache_key = f"{leg['key']}_{fetch_start.date()}"
                     if cache_key not in api_cache:
                         api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True)
@@ -113,7 +131,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                         leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
                         pnl_abs += (leg_exit - leg_entry) * leg['side'] * lot_size
             
-            # Standardize % Return by checking against total capital exposure (Underlying * Lot Size)
             capital_exposure = entry_price * lot_size
             pnl_pct = (pnl_abs / capital_exposure) * 100 if capital_exposure > 0 else 0
             
