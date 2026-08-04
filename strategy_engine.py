@@ -111,8 +111,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             exit_reason = "Data Ended"
             is_gap_exit = False
 
-        log_func(f"🎯 Exit: {exit_time} | Reason: {exit_reason}")
-
         trade_data = {
             'Symbol': clean_symbol, 'Lot Size': lot_size,
             'Entry Time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -127,9 +125,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
                 pnl_abs = (exit_price - entry_price) * lot_size if strat == "Long Equity" else (entry_price - exit_price) * lot_size
             else:
-                legs = get_option_legs(clean_symbol, entry_time, entry_price, strat)
-                if not legs:
-                    log_func(f"⚠️ Chain unavailable for {clean_symbol} {strat}")
+                # IMPORTANT UPDATE: Passed log_func here so it prints diagnostics cleanly
+                legs = get_option_legs(clean_symbol, entry_time, entry_price, strat, log_func=log_func)
                 
                 for leg in legs:
                     if leg['key'] is None:
@@ -144,8 +141,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                         leg_entry = get_premium_at_time(leg_df, entry_time, use_open=False)
                         leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
                         pnl_abs += (leg_exit - leg_entry) * leg['side'] * lot_size
-                    else:
-                        log_func(f"⚠️ Historical Data Missing for Leg: {leg['type']}")
             
             capital_exposure = entry_price * lot_size
             pnl_pct = (pnl_abs / capital_exposure) * 100 if capital_exposure > 0 else 0
