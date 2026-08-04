@@ -13,6 +13,7 @@ def get_instrument_df():
     try:
         df = pd.read_csv(UPSTOX_INSTRUMENT_URL, compression='gzip')
         df = df[df['exchange'].isin(['NSE_EQ', 'NSE_FO'])]
+        df['expiry'] = pd.to_datetime(df['expiry'], errors='coerce')
         return df
     except Exception as e:
         st.error(f"❌ Failed to download Upstox Instrument Master: {e}")
@@ -21,34 +22,34 @@ def get_instrument_df():
 def get_nfo_lot_size(symbol):
     df = get_instrument_df()
     if df.empty: return 1
+    
+    # Try name first, fallback to tradingsymbol
     derivatives = df[(df['name'] == symbol) & (df['exchange'] == 'NSE_FO')]
+    if derivatives.empty:
+        derivatives = df[(df['tradingsymbol'].str.startswith(symbol)) & (df['exchange'] == 'NSE_FO')]
+        
     if not derivatives.empty: return int(derivatives.iloc[0]['lot_size'])
     return 1 
 
 def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="1minute", is_key=False, log_func=print):
     df_inst = get_instrument_df()
     if df_inst.empty:
-        log_func("⚠️ Instrument master is empty.")
         return pd.DataFrame()
 
     if not is_key:
         clean_sym = symbol_or_key.replace("NSE:", "").replace("BSE:", "").strip()
         eq_rows = df_inst[(df_inst['tradingsymbol'] == clean_sym) & (df_inst['exchange'] == 'NSE_EQ')]
         if eq_rows.empty:
-            log_func(f"⚠️ Symbol '{clean_sym}' not found in Upstox Master.")
             return pd.DataFrame()
         instrument_key = eq_rows.iloc[0]['instrument_key']
     else:
         instrument_key = symbol_or_key
 
-    # Safe URL Encoding to prevent HTTP 400 Bad Request
     safe_instrument_key = urllib.parse.quote(instrument_key)
 
     current_date = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
     if end_dt > current_date:
         end_dt = current_date
-    if start_dt > current_date:
-        return pd.DataFrame()
 
     url = UPSTOX_HISTORICAL_URL.format(
         instrument_key=safe_instrument_key, 
@@ -69,21 +70,27 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
             df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(pytz.timezone("Asia/Kolkata")).dt.tz_localize(None)
             return df.sort_values("timestamp").reset_index(drop=True)
         else:
-            log_func(f"❌ Upstox API Error HTTP {response.status_code} for {instrument_key}")
             return pd.DataFrame()
-    except Exception as e:
-        log_func(f"❌ Exception fetching candles: {e}")
+    except Exception:
         return pd.DataFrame()
 
-def get_option_legs(symbol, entry_time, entry_price, strategy):
+def get_option_legs(symbol, entry_time, entry_price, strategy, log_func=print):
     df = get_instrument_df()
     if df.empty: return []
     
-    # 1. Broad filter: Grab ALL F&O instruments for this specific stock
+    # 1. ROBUST SEARCH: Try matching 'name' first
     opts = df[(df['name'] == symbol) & (df['exchange'] == 'NSE_FO')].copy()
-    if opts.empty: return []
     
-    # 2. Strict type conversions so math operations don't fail
+    # Fallback to scanning tradingsymbol if 'name' is missing
+    if opts.empty:
+        opts = df[(df['tradingsymbol'].str.startswith(symbol)) & (df['exchange'] == 'NSE_FO') & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX']))].copy()
+
+    if opts.empty: 
+        if strategy == "Options: Naked Call Buy":  # Only print once per stock
+            log_func(f"⚠️ DEBUG: {symbol} has zero options listed in Upstox Master.")
+        return []
+
+    # 2. STRICT FILTERING
     opts['strike'] = pd.to_numeric(opts['strike'], errors='coerce')
     opts = opts.dropna(subset=['strike'])
     
@@ -92,16 +99,23 @@ def get_option_legs(symbol, entry_time, entry_price, strategy):
     
     entry_date = pd.to_datetime(entry_time).date()
     
-    # 3. Find the current chain
+    # 3. DATE MATCHING
     future_opts = opts[opts['expiry_date'] >= entry_date]
-    if future_opts.empty: return []
+    if future_opts.empty:
+        if strategy == "Options: Naked Call Buy":
+            avail_dates = sorted(opts['expiry_date'].unique())[:3]
+            log_func(f"⚠️ DEBUG: {symbol} options found, but all expire BEFORE {entry_date}. Available: {avail_dates}")
+        return []
     
     closest_expiry = future_opts['expiry_date'].min()
     current_chain = future_opts[future_opts['expiry_date'] == closest_expiry]
 
     unique_strikes = sorted(current_chain['strike'].unique())
-    if not unique_strikes: return []
-    
+    if not unique_strikes: 
+        if strategy == "Options: Naked Call Buy":
+            log_func(f"⚠️ DEBUG: {symbol} missing valid strikes for expiry {closest_expiry}")
+        return []
+        
     closest_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - entry_price))
     
     try:
@@ -112,9 +126,12 @@ def get_option_legs(symbol, entry_time, entry_price, strategy):
         otm2_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 2)]
     except IndexError:
         return [] 
+        
+    if strategy == "Options: Naked Call Buy":
+        log_func(f"✅ DEBUG: Option Chain matched for {symbol}! ATM Strike: {atm} | Expiry: {closest_expiry}")
 
     def get_key(s, opt_type):
-        leg = current_chain[(current_chain['strike'] == s) & (current_chain['tradingsymbol'].astype(str).str.endswith(opt_type))]
+        leg = current_chain[(current_chain['strike'] == float(s)) & (current_chain['tradingsymbol'].astype(str).str.endswith(opt_type))]
         return leg.iloc[0]['instrument_key'] if not leg.empty else None
 
     legs = []
