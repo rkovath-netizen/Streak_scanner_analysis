@@ -1,39 +1,43 @@
 import requests
 import pandas as pd
 import pytz
+import streamlit as st
 
 UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 UPSTOX_HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
 
-_INSTRUMENT_DF_CACHE = None
-
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_instrument_df():
-    global _INSTRUMENT_DF_CACHE
-    if _INSTRUMENT_DF_CACHE is not None:
-        return _INSTRUMENT_DF_CACHE
+    """Downloads and caches the full Upstox Instrument Master for 1 hour."""
     try:
         df = pd.read_csv(UPSTOX_INSTRUMENT_URL, compression='gzip')
         df = df[df['exchange'].isin(['NSE_EQ', 'NSE_FO'])]
         df['expiry'] = pd.to_datetime(df['expiry'], errors='coerce')
-        _INSTRUMENT_DF_CACHE = df
-        return _INSTRUMENT_DF_CACHE
+        return df
     except Exception as e:
-        print(f"[ERROR] Instrument master download failed: {e}")
+        st.error(f"❌ Failed to download Upstox Instrument Master: {e}")
         return pd.DataFrame()
 
 def get_nfo_lot_size(symbol):
     df = get_instrument_df()
+    if df.empty:
+        return 1
     derivatives = df[(df['name'] == symbol) & (df['exchange'] == 'NSE_FO')]
     if not derivatives.empty:
         return int(derivatives.iloc[0]['lot_size'])
     return 1 
 
-def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="15minute", is_key=False):
+def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="15minute", is_key=False, log_func=print):
     df_inst = get_instrument_df()
+    if df_inst.empty:
+        log_func("⚠️ Instrument master is empty.")
+        return pd.DataFrame()
+
     if not is_key:
         clean_sym = symbol_or_key.replace("NSE:", "").replace("BSE:", "").strip()
         eq_rows = df_inst[(df_inst['tradingsymbol'] == clean_sym) & (df_inst['exchange'] == 'NSE_EQ')]
         if eq_rows.empty:
+            log_func(f"⚠️ Symbol '{clean_sym}' not found in Upstox Master.")
             return pd.DataFrame()
         instrument_key = eq_rows.iloc[0]['instrument_key']
     else:
@@ -49,16 +53,22 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
         if response.status_code == 200:
             candles = response.json().get("data", {}).get("candles", [])
             if not candles:
+                log_func(f"⚠️ No candles returned for key {instrument_key}")
                 return pd.DataFrame()
             df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
             df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(pytz.timezone("Asia/Kolkata")).dt.tz_localize(None)
             return df.sort_values("timestamp").reset_index(drop=True)
-        return pd.DataFrame()
-    except Exception:
+        else:
+            log_func(f"❌ Upstox API Error HTTP {response.status_code}: {response.text}")
+            return pd.DataFrame()
+    except Exception as e:
+        log_func(f"❌ Exception fetching candles: {e}")
         return pd.DataFrame()
 
 def get_option_legs(symbol, entry_time, entry_price, strategy):
     df = get_instrument_df()
+    if df.empty:
+        return []
     opts = df[(df['name'] == symbol) & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX']))].copy()
     if opts.empty:
         return []
