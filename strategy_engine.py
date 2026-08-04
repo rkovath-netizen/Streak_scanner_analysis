@@ -14,18 +14,11 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
     
     for f in csv_files:
         try:
-            if hasattr(f, 'name'):
-                log_func(f"📄 Reading input: {f.name}")
-            else:
-                log_func("📄 Reading pasted input data...")
-                
             df = pd.read_csv(f)
             df = df[df['seg_sym'].astype(str).str.strip() != 'seg_sym']
             
             if not df.empty and 'seg_sym' in df.columns and 'time' in df.columns:
                 all_signals.append(df)
-            else:
-                log_func("⚠️ Skipped: Missing 'seg_sym' or 'time' columns.")
         except Exception as e:
             log_func(f"❌ Error parsing input: {e}")
 
@@ -111,6 +104,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             exit_reason = "Data Ended"
             is_gap_exit = False
 
+        log_func(f"🎯 Exit: {exit_time} | Reason: {exit_reason}")
+
         trade_data = {
             'Symbol': clean_symbol, 'Lot Size': lot_size,
             'Entry Time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -125,13 +120,12 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
                 pnl_abs = (exit_price - entry_price) * lot_size if strat == "Long Equity" else (entry_price - exit_price) * lot_size
             else:
-                # IMPORTANT UPDATE: Passed log_func here so it prints diagnostics cleanly
                 legs = get_option_legs(clean_symbol, entry_time, entry_price, strat, log_func=log_func)
                 
+                if not legs and strat == "Options: Naked Call Buy":
+                    log_func(f"⚠️ Chain unavailable for {clean_symbol}")
+                
                 for leg in legs:
-                    if leg['key'] is None:
-                        continue
-                        
                     cache_key = f"{leg['key']}_{fetch_start.date()}"
                     if cache_key not in api_cache:
                         api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True, log_func=log_func)
