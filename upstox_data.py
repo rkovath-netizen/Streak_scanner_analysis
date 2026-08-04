@@ -2,7 +2,7 @@ import requests
 import pandas as pd
 import pytz
 import streamlit as st
-import urllib.parse  # Added to fix the HTTP 400 URL error
+import urllib.parse
 from datetime import datetime
 
 UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
@@ -13,7 +13,6 @@ def get_instrument_df():
     try:
         df = pd.read_csv(UPSTOX_INSTRUMENT_URL, compression='gzip')
         df = df[df['exchange'].isin(['NSE_EQ', 'NSE_FO'])]
-        df['expiry'] = pd.to_datetime(df['expiry'], errors='coerce')
         return df
     except Exception as e:
         st.error(f"❌ Failed to download Upstox Instrument Master: {e}")
@@ -26,7 +25,6 @@ def get_nfo_lot_size(symbol):
     if not derivatives.empty: return int(derivatives.iloc[0]['lot_size'])
     return 1 
 
-# Changed default interval to '1minute' to comply with Upstox API rules
 def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="1minute", is_key=False, log_func=print):
     df_inst = get_instrument_df()
     if df_inst.empty:
@@ -43,13 +41,14 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
     else:
         instrument_key = symbol_or_key
 
-    # FIX 1: Safely URL encode the instrument key to prevent HTTP 400 (converts | to %7C)
+    # Safe URL Encoding to prevent HTTP 400 Bad Request
     safe_instrument_key = urllib.parse.quote(instrument_key)
 
-    # FIX 2: Ensure the end date doesn't exceed today (Upstox rejects future dates with HTTP 400)
     current_date = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
     if end_dt > current_date:
         end_dt = current_date
+    if start_dt > current_date:
+        return pd.DataFrame()
 
     url = UPSTOX_HISTORICAL_URL.format(
         instrument_key=safe_instrument_key, 
@@ -65,13 +64,12 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
         if response.status_code == 200:
             candles = response.json().get("data", {}).get("candles", [])
             if not candles:
-                log_func(f"⚠️ No candles returned for key {instrument_key}")
                 return pd.DataFrame()
             df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
             df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(pytz.timezone("Asia/Kolkata")).dt.tz_localize(None)
             return df.sort_values("timestamp").reset_index(drop=True)
         else:
-            log_func(f"❌ Upstox API Error HTTP {response.status_code}: {response.text}")
+            log_func(f"❌ Upstox API Error HTTP {response.status_code} for {instrument_key}")
             return pd.DataFrame()
     except Exception as e:
         log_func(f"❌ Exception fetching candles: {e}")
@@ -80,15 +78,30 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
 def get_option_legs(symbol, entry_time, entry_price, strategy):
     df = get_instrument_df()
     if df.empty: return []
-    opts = df[(df['name'] == symbol) & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX']))].copy()
+    
+    # 1. Broad filter: Grab ALL F&O instruments for this specific stock
+    opts = df[(df['name'] == symbol) & (df['exchange'] == 'NSE_FO')].copy()
     if opts.empty: return []
     
-    future_opts = opts[opts['expiry'].dt.date >= entry_time.date()]
+    # 2. Strict type conversions so math operations don't fail
+    opts['strike'] = pd.to_numeric(opts['strike'], errors='coerce')
+    opts = opts.dropna(subset=['strike'])
+    
+    opts['expiry_date'] = pd.to_datetime(opts['expiry'], errors='coerce').dt.date
+    opts = opts.dropna(subset=['expiry_date'])
+    
+    entry_date = pd.to_datetime(entry_time).date()
+    
+    # 3. Find the current chain
+    future_opts = opts[opts['expiry_date'] >= entry_date]
     if future_opts.empty: return []
-    current_chain = future_opts[future_opts['expiry'] == future_opts['expiry'].min()]
+    
+    closest_expiry = future_opts['expiry_date'].min()
+    current_chain = future_opts[future_opts['expiry_date'] == closest_expiry]
 
     unique_strikes = sorted(current_chain['strike'].unique())
     if not unique_strikes: return []
+    
     closest_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - entry_price))
     
     try:
@@ -101,22 +114,22 @@ def get_option_legs(symbol, entry_time, entry_price, strategy):
         return [] 
 
     def get_key(s, opt_type):
-        leg = current_chain[(current_chain['strike'] == s) & (current_chain['instrument_type'] == opt_type)]
+        leg = current_chain[(current_chain['strike'] == s) & (current_chain['tradingsymbol'].astype(str).str.endswith(opt_type))]
         return leg.iloc[0]['instrument_key'] if not leg.empty else None
 
     legs = []
-    if strategy == "Options: Naked Call Buy": legs.append({'key': get_key(atm, 'CE'), 'side': 1})
-    elif strategy == "Options: Naked Put Buy": legs.append({'key': get_key(atm, 'PE'), 'side': 1})
+    if strategy == "Options: Naked Call Buy": legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': 1})
+    elif strategy == "Options: Naked Put Buy": legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': 1})
     elif strategy == "Options: Long Straddle":
-        legs.append({'key': get_key(atm, 'CE'), 'side': 1})
-        legs.append({'key': get_key(atm, 'PE'), 'side': 1})
+        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': 1})
+        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': 1})
     elif strategy == "Options: Bull Put Spread (ATM & OTM1)":
-        legs.append({'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'key': get_key(otm1_pe, 'PE'), 'side': 1})
+        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'type': 'OTM1 PE', 'key': get_key(otm1_pe, 'PE'), 'side': 1})
     elif strategy == "Options: Bull Put Spread (ATM & OTM2)":
-        legs.append({'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'key': get_key(otm2_pe, 'PE'), 'side': 1})
+        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'type': 'OTM2 PE', 'key': get_key(otm2_pe, 'PE'), 'side': 1})
     elif strategy == "Options: Bear Call Spread (ATM & OTM1)":
-        legs.append({'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'key': get_key(otm1_ce, 'CE'), 'side': 1})
+        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'type': 'OTM1 CE', 'key': get_key(otm1_ce, 'CE'), 'side': 1})
     elif strategy == "Options: Bear Call Spread (ATM & OTM2)":
-        legs.append({'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'key': get_key(otm2_ce, 'CE'), 'side': 1})
+        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'type': 'OTM2 CE', 'key': get_key(otm2_ce, 'CE'), 'side': 1})
         
     return [l for l in legs if l['key'] is not None]
