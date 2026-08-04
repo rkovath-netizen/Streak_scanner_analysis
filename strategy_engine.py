@@ -20,14 +20,10 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 log_func("📄 Reading pasted input data...")
                 
             df = pd.read_csv(f)
-            
-            # --- THE MAGIC FIX FOR MULTIPLE PASTED FILES ---
-            # This drops any accidental header rows pasted in the middle of the data
             df = df[df['seg_sym'].astype(str).str.strip() != 'seg_sym']
             
             if not df.empty and 'seg_sym' in df.columns and 'time' in df.columns:
                 all_signals.append(df)
-                log_func(f"✅ Loaded {len(df)} valid signal rows.")
             else:
                 log_func("⚠️ Skipped: Missing 'seg_sym' or 'time' columns.")
         except Exception as e:
@@ -38,8 +34,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         return pd.DataFrame()
 
     combined_df = pd.concat(all_signals, ignore_index=True)
-    
-    # Ensure time column formats cleanly, filtering out any corrupt dates
     combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
     combined_df = combined_df.dropna(subset=['time'])
     
@@ -134,7 +128,13 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 pnl_abs = (exit_price - entry_price) * lot_size if strat == "Long Equity" else (entry_price - exit_price) * lot_size
             else:
                 legs = get_option_legs(clean_symbol, entry_time, entry_price, strat)
+                if not legs:
+                    log_func(f"⚠️ Chain unavailable for {clean_symbol} {strat}")
+                
                 for leg in legs:
+                    if leg['key'] is None:
+                        continue
+                        
                     cache_key = f"{leg['key']}_{fetch_start.date()}"
                     if cache_key not in api_cache:
                         api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True, log_func=log_func)
@@ -144,6 +144,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                         leg_entry = get_premium_at_time(leg_df, entry_time, use_open=False)
                         leg_exit = get_premium_at_time(leg_df, exit_time, use_open=is_gap_exit)
                         pnl_abs += (leg_exit - leg_entry) * leg['side'] * lot_size
+                    else:
+                        log_func(f"⚠️ Historical Data Missing for Leg: {leg['type']}")
             
             capital_exposure = entry_price * lot_size
             pnl_pct = (pnl_abs / capital_exposure) * 100 if capital_exposure > 0 else 0
