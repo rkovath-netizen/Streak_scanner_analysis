@@ -46,7 +46,7 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
 
     safe_instrument_key = urllib.parse.quote(instrument_key)
 
-    # FIX: Ensure dates are timezone-naive to prevent TypeError crashes
+    # Ensure dates are timezone-naive to prevent TypeError crashes
     current_date = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
     start_dt = pd.to_datetime(start_dt).tz_localize(None)
     end_dt = pd.to_datetime(end_dt).tz_localize(None)
@@ -83,36 +83,40 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, log_func=print):
     df = get_instrument_df()
     if df.empty: return []
     
-    # 1. Broad Search: Relying on tradingsymbol since 'name' can sometimes be full company name
-    opts = df[(df['tradingsymbol'].str.startswith(symbol)) & (df['exchange'] == 'NSE_FO') & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX']))].copy()
+    # 1. UNIVERSAL FILTER: Matches both Index (OPTIDX) and Stocks (OPTSTK)
+    opts = df[
+        (df['exchange'] == 'NSE_FO') & 
+        (df['instrument_type'].isin(['OPTSTK', 'OPTIDX'])) & 
+        ((df['name'] == symbol) | (df['tradingsymbol'].str.startswith(symbol)))
+    ].copy()
     
     if opts.empty:
-        if strategy == "Options: Naked Call Buy": # Limit spam by logging only once per trade
-            log_func(f"⚠️ [Chain Debug] {symbol}: No options found in master file.")
+        if strategy == "Options: Naked Call Buy":
+            log_func(f"⚠️ [Chain Debug] {symbol}: No matching options found in master.")
         return []
 
-    # 2. Strict Type Casting
+    # 2. CLEAN STRIKES AND EXPIRY
     opts['strike'] = pd.to_numeric(opts['strike'], errors='coerce')
     opts = opts.dropna(subset=['strike'])
     opts['expiry_date'] = pd.to_datetime(opts['expiry'], errors='coerce').dt.date
     opts = opts.dropna(subset=['expiry_date'])
     
+    if opts.empty: return []
+
+    # 3. DATE MATCHING
     entry_date = pd.to_datetime(entry_time).date()
     future_opts = opts[opts['expiry_date'] >= entry_date]
     
     if future_opts.empty:
         if strategy == "Options: Naked Call Buy":
-            log_func(f"⚠️ [Chain Debug] {symbol}: Expiries found, but all expire BEFORE {entry_date}.")
+            log_func(f"⚠️ [Chain Debug] {symbol}: No expiries found on or after {entry_date}.")
         return []
     
     closest_expiry = future_opts['expiry_date'].min()
     current_chain = future_opts[future_opts['expiry_date'] == closest_expiry]
 
     unique_strikes = sorted(current_chain['strike'].unique())
-    if not unique_strikes:
-        if strategy == "Options: Naked Call Buy":
-            log_func(f"⚠️ [Chain Debug] {symbol}: Valid expiry found ({closest_expiry}), but strikes missing.")
-        return []
+    if not unique_strikes: return []
         
     closest_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - entry_price))
     
@@ -123,16 +127,15 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, log_func=print):
         otm1_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 1)]
         otm2_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 2)]
     except Exception as e:
-        log_func(f"⚠️ [Chain Debug] {symbol}: Index math failed: {e}")
         return [] 
         
     def get_key(s, opt_type):
         target_strike = float(s)
-        # FIX: Floating point tolerance match for strikes to prevent precision bugs
-        if 'option_type' in current_chain.columns:
-            leg = current_chain[(abs(current_chain['strike'] - target_strike) < 0.01) & (current_chain['option_type'] == opt_type)]
-        else:
-            leg = current_chain[(abs(current_chain['strike'] - target_strike) < 0.01) & (current_chain['tradingsymbol'].astype(str).str.endswith(opt_type))]
+        # Precision match for strikes to prevent floating-point bugs
+        leg = current_chain[
+            (abs(current_chain['strike'] - target_strike) < 0.05) & 
+            (current_chain['tradingsymbol'].astype(str).str.endswith(opt_type))
+        ]
         return leg.iloc[0]['instrument_key'] if not leg.empty else None
 
     legs = []
@@ -150,9 +153,4 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, log_func=print):
     elif strategy == "Options: Bear Call Spread (ATM & OTM2)":
         legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'type': 'OTM2 CE', 'key': get_key(otm2_ce, 'CE'), 'side': 1})
         
-    valid_legs = [l for l in legs if l['key'] is not None]
-    
-    if not valid_legs and strategy == "Options: Naked Call Buy":
-        log_func(f"⚠️ [Chain Debug] {symbol}: Keys returned NULL. ATM: {atm}, Expiry: {closest_expiry}")
-        
-    return valid_legs
+    return [l for l in legs if l['key'] is not None]
