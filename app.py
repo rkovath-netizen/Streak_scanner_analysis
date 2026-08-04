@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import io
 from datetime import datetime
 from strategy_engine import process_streak_comparative_batch
 from metrics_calculator import generate_comparison_metrics
@@ -36,29 +37,7 @@ if st.sidebar.button("🧪 Test Upstox Connection"):
         else:
             st.sidebar.error("❌ Upstox connection failed.")
 
-# -------------------------------------------------------------
-# MOBILE FIX 2.0: Removed 'type' restriction to bypass Android MIME rejection
-# -------------------------------------------------------------
-st.markdown("### 📂 Step 1: Upload Files")
-uploaded_files = st.file_uploader(
-    "Upload Streak CSV Scanner Exports", 
-    accept_multiple_files=True
-    # 'type' argument is intentionally removed so Android doesn't silently block the files.
-)
-
-# Instant File Upload Debug / Status Tracker
-if uploaded_files:
-    st.success(f"✅ Upload Status: {len(uploaded_files)} file(s) successfully attached to the app!")
-    with st.expander("👀 View Attached Files (Debug)"):
-        for i, f in enumerate(uploaded_files):
-            st.text(f"{i+1}. {f.name} (Size: {f.size} bytes)")
-else:
-    st.info("Upload Status: Waiting for files... (The box above will populate once files are attached)")
-
-st.markdown("### ⚙️ Step 2: Execute")
-run_backtest = st.button("🚀 Run Comparative Backtest")
-
-# Debug Console Container
+# Debug Console Container (Moved to top so it's always visible)
 log_expander = st.expander("🛠️ Real-Time Debug & Execution Logs", expanded=True)
 log_box = log_expander.empty()
 log_messages = []
@@ -69,10 +48,48 @@ def ui_log(msg):
     log_messages.append(formatted_msg)
     log_box.code("\n".join(log_messages[-25:]), language="text")
 
+# -------------------------------------------------------------
+# Input Methods (Tabs for Mobile Fallback)
+# -------------------------------------------------------------
+tab1, tab2 = st.tabs(["📁 File Uploader", "📝 Paste CSV (Mobile Fallback)"])
+
+files_to_process = None
+run_backtest = False
+
+with tab1:
+    st.markdown("### Step 1: Upload Files")
+    uploaded_files = st.file_uploader("Upload Streak CSV Scanner Exports", accept_multiple_files=True)
+    
+    if uploaded_files:
+        st.success(f"✅ Upload Status: {len(uploaded_files)} file(s) successfully attached!")
+        with st.expander("👀 View Attached Files (Debug)"):
+            for i, f in enumerate(uploaded_files):
+                st.text(f"{i+1}. {f.name} (Size: {f.size} bytes)")
+    
+    if st.button("🚀 Run Backtest (Uploaded Files)"):
+        files_to_process = uploaded_files
+        run_backtest = True
+
+with tab2:
+    st.info("💡 **Android Workaround:** If the file uploader above is not working, open your CSV file, copy all the text, and paste it here.")
+    pasted_csv = st.text_area("Paste Streak CSV data here:", height=200, placeholder="s_no,seg_sym,sector,ltp,change,volume,time\n1,NSE:RELIANCE,,2500,1.5,50000,2026-07-22 09:30:00")
+    
+    if st.button("🚀 Run Backtest (Pasted Data)"):
+        if pasted_csv.strip():
+            # Convert pasted text into a mock file object that Pandas can read
+            mock_file = io.StringIO(pasted_csv)
+            mock_file.name = "pasted_mobile_data.csv"
+            files_to_process = [mock_file]
+            run_backtest = True
+        else:
+            st.error("⚠️ Please paste some CSV data first.")
+
+# -------------------------------------------------------------
 # Execution Logic
+# -------------------------------------------------------------
 if run_backtest:
-    if not uploaded_files:
-        st.error("⚠️ Please upload at least one CSV file before running.")
+    if not files_to_process:
+        st.error("⚠️ Please upload a file or paste CSV data before running.")
     elif not upstox_token:
         st.error("❌ Cannot proceed: UPSTOX_ACCESS_TOKEN is missing from Secrets.")
     else:
@@ -86,7 +103,7 @@ if run_backtest:
         ui_log("Starting backtest run...")
         
         trades_df = process_streak_comparative_batch(
-            csv_files=uploaded_files, upstox_token=upstox_token,
+            csv_files=files_to_process, upstox_token=upstox_token,
             setup_direction=setup_direction, tp_pct=tp_pct, sl_pct=sl_pct,
             max_hold_days=max_hold_days, progress_callback=update_progress,
             log_func=ui_log
@@ -99,10 +116,10 @@ if run_backtest:
             
             comparison_df = generate_comparison_metrics(trades_df)
 
-            st.subheader("📊 Strategy Performance Comparison (All Variants)")
+            st.subheader("📊 Strategy Performance Comparison")
             st.dataframe(comparison_df, use_container_width=True)
 
-            st.subheader("📄 Detailed Trade Log (Side-by-Side PnL)")
+            st.subheader("📄 Detailed Trade Log")
             st.dataframe(trades_df, use_container_width=True)
 
             csv_buffer = trades_df.to_csv(index=False)
