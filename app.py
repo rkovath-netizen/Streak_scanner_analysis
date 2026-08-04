@@ -37,17 +37,28 @@ if st.sidebar.button("🧪 Test Upstox Connection"):
             st.sidebar.error("❌ Upstox connection failed.")
 
 # -------------------------------------------------------------
-# MOBILE FIX: File Uploader and Button placed inside a FORM
+# MOBILE FIX 2.0: Removed 'type' restriction to bypass Android MIME rejection
 # -------------------------------------------------------------
-with st.form("backtest_form"):
-    uploaded_files = st.file_uploader(
-        "Upload Streak CSV Scanner Exports", 
-        type=["csv", "txt", "tsv"], 
-        accept_multiple_files=True
-    )
-    run_backtest = st.form_submit_button("🚀 Run Comparative Backtest")
+st.markdown("### 📂 Step 1: Upload Files")
+uploaded_files = st.file_uploader(
+    "Upload Streak CSV Scanner Exports", 
+    accept_multiple_files=True
+    # 'type' argument is intentionally removed so Android doesn't silently block the files.
+)
 
-# Debug Console Container (Placed outside form to update live)
+# Instant File Upload Debug / Status Tracker
+if uploaded_files:
+    st.success(f"✅ Upload Status: {len(uploaded_files)} file(s) successfully attached to the app!")
+    with st.expander("👀 View Attached Files (Debug)"):
+        for i, f in enumerate(uploaded_files):
+            st.text(f"{i+1}. {f.name} (Size: {f.size} bytes)")
+else:
+    st.info("Upload Status: Waiting for files... (The box above will populate once files are attached)")
+
+st.markdown("### ⚙️ Step 2: Execute")
+run_backtest = st.button("🚀 Run Comparative Backtest")
+
+# Debug Console Container
 log_expander = st.expander("🛠️ Real-Time Debug & Execution Logs", expanded=True)
 log_box = log_expander.empty()
 log_messages = []
@@ -58,7 +69,7 @@ def ui_log(msg):
     log_messages.append(formatted_msg)
     log_box.code("\n".join(log_messages[-25:]), language="text")
 
-# Execution Logic triggered ONLY when the form button is pressed
+# Execution Logic
 if run_backtest:
     if not uploaded_files:
         st.error("⚠️ Please upload at least one CSV file before running.")
