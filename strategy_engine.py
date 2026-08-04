@@ -28,9 +28,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
 
     combined_df = pd.concat(all_signals, ignore_index=True)
     
-    # -------------------------------------------------------------
-    # FIX: Clean the timezone from Streak CSV to match Upstox Data
-    # -------------------------------------------------------------
     try:
         combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
         if combined_df['time'].dt.tz is not None:
@@ -73,7 +70,10 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         fetch_start = entry_time
         fetch_end = entry_time + timedelta(days=10) 
 
-        spot_df = fetch_upstox_intraday_candles(clean_symbol, fetch_start, fetch_end, upstox_token, is_key=False, log_func=log_func)
+        spot_df = fetch_upstox_intraday_candles(
+            clean_symbol, fetch_start, fetch_end, upstox_token, 
+            is_key=False, is_expired=False, log_func=log_func
+        )
         if spot_df.empty:
             log_func(f"⚠️ Could not retrieve candles for {clean_symbol}. Skipping.")
             continue
@@ -114,8 +114,6 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             exit_reason = "Data Ended"
             is_gap_exit = False
 
-        log_func(f"🎯 Exit: {exit_time} | Reason: {exit_reason}")
-
         trade_data = {
             'Symbol': clean_symbol, 'Lot Size': lot_size,
             'Entry Time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -130,11 +128,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 exit_price = underlying_exit['open'] if is_gap_exit else underlying_exit['close']
                 pnl_abs = (exit_price - entry_price) * lot_size if strat == "Long Equity" else (entry_price - exit_price) * lot_size
             else:
-                legs = get_option_legs(clean_symbol, entry_time, entry_price, strat, log_func=log_func)
-                
-                # Prevents UI log spam by only alerting once per stock
-                if not legs and strat == "Options: Naked Call Buy":
-                    log_func(f"⚠️ Chain unavailable for {clean_symbol}")
+                # Upstox Token is now passed directly so the Option Chain API can be authenticated
+                legs = get_option_legs(clean_symbol, entry_time, entry_price, strat, access_token=upstox_token, log_func=log_func)
                 
                 for leg in legs:
                     if leg['key'] is None:
@@ -142,7 +137,15 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                         
                     cache_key = f"{leg['key']}_{fetch_start.date()}"
                     if cache_key not in api_cache:
-                        api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True, log_func=log_func)
+                        api_cache[cache_key] = fetch_upstox_intraday_candles(
+                            symbol_or_key=leg['key'], 
+                            start_dt=fetch_start, 
+                            end_dt=fetch_end, 
+                            access_token=upstox_token, 
+                            is_key=True, 
+                            is_expired=leg.get('is_expired', False),
+                            log_func=log_func
+                        )
                     
                     leg_df = api_cache[cache_key]
                     if not leg_df.empty:
