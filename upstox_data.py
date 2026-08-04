@@ -7,6 +7,7 @@ from datetime import datetime
 
 UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 UPSTOX_HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
+UPSTOX_EXPIRED_HISTORICAL_URL = "https://api.upstox.com/v2/expired-instruments/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_instrument_df():
@@ -34,7 +35,7 @@ def get_nfo_lot_size(symbol):
     if not derivatives.empty: return int(derivatives.iloc[0]['lot_size'])
     return 1 
 
-def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="1minute", is_key=False, log_func=print):
+def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="1minute", is_key=False, is_expired=False, log_func=print):
     df_inst = get_instrument_df()
     if df_inst.empty:
         return pd.DataFrame()
@@ -59,7 +60,9 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
     if start_dt > current_date:
         return pd.DataFrame()
 
-    url = UPSTOX_HISTORICAL_URL.format(
+    # Route to the correct Upstox endpoint based on whether the instrument is expired
+    base_url = UPSTOX_EXPIRED_HISTORICAL_URL if is_expired else UPSTOX_HISTORICAL_URL
+    url = base_url.format(
         instrument_key=safe_instrument_key, 
         unit=interval,
         to_date=end_dt.strftime("%Y-%m-%d"), 
@@ -82,60 +85,91 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
     except Exception:
         return pd.DataFrame()
 
-def get_option_legs(symbol, entry_time, entry_price, strategy, log_func=print):
-    df = get_instrument_df()
-    if df.empty: return []
+def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log_func=print):
+    df_inst = get_instrument_df()
+    if df_inst.empty: return []
     
-    # -------------------------------------------------------------
-    # 🔬 HARD DEBUG: Validate Cash vs. F&O Status Live
-    # -------------------------------------------------------------
-    if strategy == "Options: Naked Call Buy": # Only print this diagnostic once per stock
-        eq_matches = df[(df['exchange'] == 'NSE_EQ') & ((df['name'] == symbol) | (df['tradingsymbol'] == symbol))]
-        if 'underlying_symbol' in df.columns:
-            fo_matches = df[(df['exchange'] == 'NSE_FO') & (df['underlying_symbol'] == symbol)]
-        else:
-            fo_matches = df[(df['exchange'] == 'NSE_FO') & ((df['name'] == symbol) | (df['tradingsymbol'].str.startswith(symbol)))]
-        
-        eq_count = len(eq_matches)
-        fo_count = len(fo_matches)
-        
-        log_func(f"🔬 [DIAGNOSTIC] {symbol} | NSE_EQ (Cash): {eq_count} matches | NSE_FO (Options): {fo_count} matches")
-        
-        if fo_count == 0 and eq_count > 0:
-            log_func(f"⚠️ CONFIRMED: {symbol} is a Cash-Only stock in the Upstox Master. Options skipped.")
-            return []
-        elif fo_count == 0 and eq_count == 0:
-            log_func(f"❌ ERROR: {symbol} does not exist in the Upstox Master file at all.")
-            return []
-
-    # 1. ROBUST SYMBOL MATCHER
-    if 'underlying_symbol' in df.columns:
-        opts = df[(df['exchange'] == 'NSE_FO') & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX'])) & (df['underlying_symbol'] == symbol)].copy()
-    else:
-        opts = df[(df['exchange'] == 'NSE_FO') & (df['instrument_type'].isin(['OPTSTK', 'OPTIDX'])) & ((df['name'] == symbol) | (df['tradingsymbol'].str.startswith(symbol)))].copy()
-    
-    if opts.empty:
-        return []
-
-    opts['strike'] = pd.to_numeric(opts['strike'], errors='coerce')
-    opts = opts.dropna(subset=['strike'])
-    opts['expiry_date'] = pd.to_datetime(opts['expiry'], errors='coerce').dt.date
-    opts = opts.dropna(subset=['expiry_date'])
-    
-    if opts.empty: return []
-
-    entry_date = pd.to_datetime(entry_time).date()
-    future_opts = opts[opts['expiry_date'] >= entry_date]
-    
-    if future_opts.empty:
+    # 1. Get the underlying Cash Instrument Key (Required for the API calls)
+    eq_rows = df_inst[(df_inst['tradingsymbol'] == symbol) & (df_inst['exchange'] == 'NSE_EQ')]
+    if eq_rows.empty:
         if strategy == "Options: Naked Call Buy":
-            log_func(f"⚠️ [Chain Debug] {symbol}: No expiries found on or after {entry_date}. Available: {sorted(opts['expiry_date'].unique())[:3]}")
+            log_func(f"⚠️ {symbol}: No underlying Cash instrument found in Master.")
         return []
+        
+    eq_key = eq_rows.iloc[0]['instrument_key']
+    safe_eq_key = urllib.parse.quote(eq_key)
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
     
-    closest_expiry = future_opts['expiry_date'].min()
-    current_chain = future_opts[future_opts['expiry_date'] == closest_expiry]
+    entry_date = pd.to_datetime(entry_time).date()
+    current_date = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    
+    # 2. Fetch ALL Expiries (Merge Live Expiries + Expired Expiries via API)
+    active_expiries = []
+    if 'underlying_symbol' in df_inst.columns:
+        opts_active = df_inst[(df_inst['exchange'] == 'NSE_FO') & (df_inst['underlying_symbol'] == symbol)]
+    else:
+        opts_active = df_inst[(df_inst['exchange'] == 'NSE_FO') & ((df_inst['name'] == symbol) | (df_inst['tradingsymbol'].str.startswith(symbol)))]
+        
+    if not opts_active.empty:
+        active_expiries = pd.to_datetime(opts_active['expiry'], errors='coerce').dt.date.dropna().unique().tolist()
+        
+    expired_expiries = []
+    try:
+        # Upstox Expired Instruments API
+        exp_url = f"https://api.upstox.com/v2/expired-instruments/expiries?instrument_key={safe_eq_key}"
+        res = requests.get(exp_url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('data', [])
+            expired_expiries = [pd.to_datetime(d).date() for d in data]
+    except Exception:
+        pass 
 
-    unique_strikes = sorted(current_chain['strike'].unique())
+    all_expiries = sorted(list(set(active_expiries + expired_expiries)))
+    future_expiries = [d for d in all_expiries if d >= entry_date]
+    
+    if not future_expiries:
+        if strategy == "Options: Naked Call Buy":
+            log_func(f"⚠️ {symbol}: No expiries found >= {entry_date}. (Cash-only stock?)")
+        return []
+        
+    closest_expiry = future_expiries[0]
+    is_expired = closest_expiry < current_date
+    
+    # 3. Methodically Fetch EXACT Option Contracts for that Expiry
+    chain_df = pd.DataFrame()
+    if is_expired:
+        try:
+            # Upstox Expired Option Contracts API
+            opt_url = f"https://api.upstox.com/v2/expired-instruments/option/contract?instrument_key={safe_eq_key}&expiry_date={closest_expiry.strftime('%Y-%m-%d')}"
+            res = requests.get(opt_url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                contracts = res.json().get('data', [])
+                chain_df = pd.DataFrame(contracts)
+                if not chain_df.empty:
+                    # Normalize Upstox JSON keys to our logic
+                    if 'strike_price' in chain_df.columns:
+                        chain_df.rename(columns={'strike_price': 'strike'}, inplace=True)
+                    if 'trading_symbol' in chain_df.columns:
+                        chain_df.rename(columns={'trading_symbol': 'tradingsymbol'}, inplace=True)
+            else:
+                if strategy == "Options: Naked Call Buy":
+                    log_func(f"❌ {symbol}: Failed API fetch for expired options (HTTP {res.status_code})")
+                return []
+        except Exception as e:
+            return []
+    else:
+        if 'underlying_symbol' in df_inst.columns:
+            chain_df = df_inst[(df_inst['exchange'] == 'NSE_FO') & (df_inst['underlying_symbol'] == symbol) & (pd.to_datetime(df_inst['expiry']).dt.date == closest_expiry)].copy()
+        else:
+            chain_df = df_inst[(df_inst['exchange'] == 'NSE_FO') & (df_inst['tradingsymbol'].str.startswith(symbol)) & (pd.to_datetime(df_inst['expiry']).dt.date == closest_expiry)].copy()
+
+    if chain_df.empty:
+        return []
+
+    # 4. Process the cleanly fetched exact strikes
+    chain_df['strike'] = pd.to_numeric(chain_df['strike'], errors='coerce')
+    chain_df = chain_df.dropna(subset=['strike'])
+    unique_strikes = sorted(chain_df['strike'].unique())
     if not unique_strikes: return []
         
     closest_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - entry_price))
@@ -146,31 +180,34 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, log_func=print):
         otm2_pe = unique_strikes[max(0, closest_idx - 2)]
         otm1_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 1)]
         otm2_ce = unique_strikes[min(len(unique_strikes)-1, closest_idx + 2)]
-    except Exception as e:
-        log_func(f"❌ [Math Error] {symbol} strike calculation failed: {e}")
+    except Exception:
         return [] 
         
+    if strategy == "Options: Naked Call Buy":
+        log_func(f"✅ {symbol} | Found ATM {atm} | via {'API (Expired)' if is_expired else 'Master (Active)'}")
+
     def get_key(s, opt_type):
         target_strike = float(s)
-        leg = current_chain[
-            (abs(current_chain['strike'] - target_strike) < 0.05) & 
-            (current_chain['tradingsymbol'].astype(str).str.endswith(opt_type))
+        col_type = 'option_type' if 'option_type' in chain_df.columns else 'instrument_type'
+        leg = chain_df[
+            (abs(chain_df['strike'] - target_strike) < 0.05) & 
+            ((chain_df[col_type] == opt_type) | (chain_df['tradingsymbol'].astype(str).str.endswith(opt_type)))
         ]
         return leg.iloc[0]['instrument_key'] if not leg.empty else None
 
     legs = []
-    if strategy == "Options: Naked Call Buy": legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': 1})
-    elif strategy == "Options: Naked Put Buy": legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': 1})
+    if strategy == "Options: Naked Call Buy": legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': 1, 'is_expired': is_expired})
+    elif strategy == "Options: Naked Put Buy": legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': 1, 'is_expired': is_expired})
     elif strategy == "Options: Long Straddle":
-        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': 1})
-        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': 1})
+        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': 1, 'is_expired': is_expired})
+        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': 1, 'is_expired': is_expired})
     elif strategy == "Options: Bull Put Spread (ATM & OTM1)":
-        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'type': 'OTM1 PE', 'key': get_key(otm1_pe, 'PE'), 'side': 1})
+        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': -1, 'is_expired': is_expired}); legs.append({'type': 'OTM1 PE', 'key': get_key(otm1_pe, 'PE'), 'side': 1, 'is_expired': is_expired})
     elif strategy == "Options: Bull Put Spread (ATM & OTM2)":
-        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': -1}); legs.append({'type': 'OTM2 PE', 'key': get_key(otm2_pe, 'PE'), 'side': 1})
+        legs.append({'type': 'ATM PE', 'key': get_key(atm, 'PE'), 'side': -1, 'is_expired': is_expired}); legs.append({'type': 'OTM2 PE', 'key': get_key(otm2_pe, 'PE'), 'side': 1, 'is_expired': is_expired})
     elif strategy == "Options: Bear Call Spread (ATM & OTM1)":
-        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'type': 'OTM1 CE', 'key': get_key(otm1_ce, 'CE'), 'side': 1})
+        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1, 'is_expired': is_expired}); legs.append({'type': 'OTM1 CE', 'key': get_key(otm1_ce, 'CE'), 'side': 1, 'is_expired': is_expired})
     elif strategy == "Options: Bear Call Spread (ATM & OTM2)":
-        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1}); legs.append({'type': 'OTM2 CE', 'key': get_key(otm2_ce, 'CE'), 'side': 1})
+        legs.append({'type': 'ATM CE', 'key': get_key(atm, 'CE'), 'side': -1, 'is_expired': is_expired}); legs.append({'type': 'OTM2 CE', 'key': get_key(otm2_ce, 'CE'), 'side': 1, 'is_expired': is_expired})
         
     return [l for l in legs if l['key'] is not None]
