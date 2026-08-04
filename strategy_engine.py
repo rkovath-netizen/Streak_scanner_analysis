@@ -11,20 +11,25 @@ def get_premium_at_time(df, target_time, use_open=False):
         return future.iloc[0]['open']
     return 0.0
 
-def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, tp_pct, sl_pct, max_hold_days, progress_callback=None):
+def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, tp_pct, sl_pct, max_hold_days, progress_callback=None, log_func=print):
     all_signals = []
+    
     for f in csv_files:
         try:
+            log_func(f"📄 Reading uploaded file: {f.name} (Size: {f.size} bytes)")
             df = pd.read_csv(f)
-            # Mobile safeguard: Ignore empty CSVs or files missing required Streak columns
+            log_func(f"📊 Columns detected: {list(df.columns)}")
+            
             if not df.empty and 'seg_sym' in df.columns and 'time' in df.columns:
                 all_signals.append(df)
+                log_func(f"✅ Loaded {len(df)} signal rows from {f.name}")
             else:
-                print(f"[SKIP] Empty or invalid Streak CSV skipped.")
+                log_func(f"⚠️ Skipped {f.name}: Missing 'seg_sym' or 'time' columns.")
         except Exception as e:
-            print(f"[SKIP] Failed to parse file: {e}")
+            log_func(f"❌ Error parsing {f.name}: {e}")
 
     if not all_signals:
+        log_func("❌ No valid signals found across uploaded CSV files.")
         return pd.DataFrame()
 
     combined_df = pd.concat(all_signals, ignore_index=True)
@@ -42,6 +47,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         "Options: Bear Call Spread (ATM & OTM1)", "Options: Bear Call Spread (ATM & OTM2)"
     ]
 
+    log_func(f"🚀 Starting backtest processing for {total_trades} trade signals...")
+
     for idx, row in combined_df.iterrows():
         raw_symbol = row['seg_sym']
         entry_time = row['time']
@@ -50,7 +57,9 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         lot_size = get_nfo_lot_size(clean_symbol)
 
         if progress_callback:
-            progress_callback(idx + 1, total_trades, f"Comparing strategies for {clean_symbol}...")
+            progress_callback(idx + 1, total_trades, f"Processing Trade {idx+1}/{total_trades}: {clean_symbol}")
+
+        log_func(f"🔍 Trade {idx+1}: {clean_symbol} at {entry_time} | Entry Price: {entry_price} | Lot Size: {lot_size}")
 
         target_price = entry_price * (1 + tp_pct) if is_bullish else entry_price * (1 - tp_pct)
         sl_price = entry_price * (1 - sl_pct) if is_bullish else entry_price * (1 + sl_pct)
@@ -58,11 +67,14 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         fetch_start = entry_time
         fetch_end = entry_time + timedelta(days=10) 
 
-        spot_df = fetch_upstox_intraday_candles(clean_symbol, fetch_start, fetch_end, upstox_token, is_key=False)
+        spot_df = fetch_upstox_intraday_candles(clean_symbol, fetch_start, fetch_end, upstox_token, is_key=False, log_func=log_func)
         if spot_df.empty:
+            log_func(f"⚠️ Could not retrieve intraday spot candles for {clean_symbol}. Skipping.")
             continue
+            
         spot_df = spot_df[spot_df['timestamp'] >= entry_time].reset_index(drop=True)
         if spot_df.empty:
+            log_func(f"⚠️ No candles after entry time {entry_time} for {clean_symbol}.")
             continue
 
         exit_time, exit_reason, is_gap_exit = None, None, False
@@ -105,6 +117,8 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             exit_reason = "Data Ended"
             is_gap_exit = False
 
+        log_func(f"🎯 Exit Triggered: {exit_time} | Reason: {exit_reason}")
+
         trade_data = {
             'Symbol': clean_symbol, 'Lot Size': lot_size,
             'Entry Time': entry_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -123,7 +137,7 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
                 for leg in legs:
                     cache_key = f"{leg['key']}_{fetch_start.date()}"
                     if cache_key not in api_cache:
-                        api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True)
+                        api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True, log_func=log_func)
                     
                     leg_df = api_cache[cache_key]
                     if not leg_df.empty:
