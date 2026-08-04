@@ -10,7 +10,6 @@ from upstox_data import get_instrument_df
 st.set_page_config(page_title="Multi-Strategy Options Backtester", layout="wide")
 st.title("📈 Comparative Options Hedge Backtester")
 
-# Sidebar Configuration
 st.sidebar.header("⚙️ Configuration")
 strategy_name = st.sidebar.text_input("Report Name", value="15_MT_Momentum_Compare")
 setup_direction = st.sidebar.selectbox("Scanner Direction (Spot Exit Logic)", ["Bullish", "Bearish"])
@@ -37,7 +36,6 @@ if st.sidebar.button("🧪 Test Upstox Connection"):
         else:
             st.sidebar.error("❌ Upstox connection failed.")
 
-# Debug Console Container (Moved to top so it's always visible)
 log_expander = st.expander("🛠️ Real-Time Debug & Execution Logs", expanded=True)
 log_box = log_expander.empty()
 log_messages = []
@@ -48,35 +46,45 @@ def ui_log(msg):
     log_messages.append(formatted_msg)
     log_box.code("\n".join(log_messages[-25:]), language="text")
 
-# -------------------------------------------------------------
-# Input Methods (Tabs for Mobile Fallback)
-# -------------------------------------------------------------
-tab1, tab2 = st.tabs(["📁 File Uploader", "📝 Paste CSV (Mobile Fallback)"])
+tab1, tab2 = st.tabs(["📁 File Uploader & Diagnostics", "📝 Paste CSV (Mobile Fallback)"])
 
 files_to_process = None
 run_backtest = False
 
 with tab1:
     st.markdown("### Step 1: Upload Files")
-    uploaded_files = st.file_uploader("Upload Streak CSV Scanner Exports", accept_multiple_files=True)
+    
+    # NEW: The Diagnostic Input
+    expected_files = st.number_input("How many files are you selecting in the browser?", min_value=1, value=11, step=1)
+    
+    uploaded_files = st.file_uploader("Upload Streak CSVs (OR a single .zip file)", accept_multiple_files=True)
     
     if uploaded_files:
-        st.success(f"✅ Upload Status: {len(uploaded_files)} file(s) successfully attached!")
-        with st.expander("👀 View Attached Files (Debug)"):
+        received_count = len(uploaded_files)
+        
+        # NEW: Diagnostic Engine Output
+        st.markdown("---")
+        st.markdown("### 🔬 Upload Diagnostics")
+        
+        if received_count == expected_files:
+            st.success(f"✅ Perfect Match! You selected {expected_files} files and Streamlit received {received_count} files.")
+        else:
+            st.error(f"⚠️ MISMATCH DETECTED: You selected {expected_files} files, but the server only received {received_count} files. The browser or OS dropped {expected_files - received_count} files during the upload transfer.")
+            
+        with st.expander("👀 View Raw Data Received by Server", expanded=True):
             for i, f in enumerate(uploaded_files):
-                st.text(f"{i+1}. {f.name} (Size: {f.size} bytes)")
+                st.code(f"File {i+1}:\nName: {f.name}\nSize: {f.size} bytes\nType: {f.type}", language="text")
+        st.markdown("---")
     
     if st.button("🚀 Run Backtest (Uploaded Files)"):
         files_to_process = uploaded_files
         run_backtest = True
 
 with tab2:
-    st.info("💡 **Android Workaround:** If the file uploader above is not working, open your CSV file, copy all the text, and paste it here.")
     pasted_csv = st.text_area("Paste Streak CSV data here:", height=200, placeholder="s_no,seg_sym,sector,ltp,change,volume,time\n1,NSE:RELIANCE,,2500,1.5,50000,2026-07-22 09:30:00")
     
     if st.button("🚀 Run Backtest (Pasted Data)"):
         if pasted_csv.strip():
-            # Convert pasted text into a mock file object that Pandas can read
             mock_file = io.StringIO(pasted_csv)
             mock_file.name = "pasted_mobile_data.csv"
             files_to_process = [mock_file]
@@ -84,9 +92,6 @@ with tab2:
         else:
             st.error("⚠️ Please paste some CSV data first.")
 
-# -------------------------------------------------------------
-# Execution Logic
-# -------------------------------------------------------------
 if run_backtest:
     if not files_to_process:
         st.error("⚠️ Please upload a file or paste CSV data before running.")
