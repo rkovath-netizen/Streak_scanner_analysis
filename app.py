@@ -10,6 +10,7 @@ from upstox_data import get_instrument_df
 st.set_page_config(page_title="Multi-Strategy Options Backtester", layout="wide")
 st.title("📈 Comparative Options Hedge Backtester")
 
+# Sidebar Configuration
 st.sidebar.header("⚙️ Configuration")
 strategy_name = st.sidebar.text_input("Report Name", value="15_MT_Momentum_Compare")
 setup_direction = st.sidebar.selectbox("Scanner Direction (Spot Exit Logic)", ["Bullish", "Bearish"])
@@ -36,6 +37,10 @@ if st.sidebar.button("🧪 Test Upstox Connection"):
         else:
             st.sidebar.error("❌ Upstox connection failed.")
 
+# Initialize the Session State "Basket" for accumulated files
+if "accumulated_files" not in st.session_state:
+    st.session_state.accumulated_files = {}
+
 log_expander = st.expander("🛠️ Real-Time Debug & Execution Logs", expanded=True)
 log_box = log_expander.empty()
 log_messages = []
@@ -46,39 +51,50 @@ def ui_log(msg):
     log_messages.append(formatted_msg)
     log_box.code("\n".join(log_messages[-25:]), language="text")
 
-tab1, tab2 = st.tabs(["📁 File Uploader & Diagnostics", "📝 Paste CSV (Mobile Fallback)"])
+tab1, tab2 = st.tabs(["📁 Accumulating Uploader (Mobile Fix)", "📝 Paste CSV (Fallback)"])
 
 files_to_process = None
 run_backtest = False
 
 with tab1:
-    st.markdown("### Step 1: Upload Files")
+    st.markdown("### Step 1: Upload Files (Max 7 at a time)")
+    st.info("📱 **Android Fix:** Since your browser caps uploads at 7 files, just upload them in batches! Upload 7, then upload 7 more. They will accumulate in the basket below.")
     
-    # NEW: The Diagnostic Input
-    expected_files = st.number_input("How many files are you selecting in the browser?", min_value=1, value=11, step=1)
+    current_uploads = st.file_uploader("Select up to 7 CSV files to add to the basket:", accept_multiple_files=True)
     
-    uploaded_files = st.file_uploader("Upload Streak CSVs (OR a single .zip file)", accept_multiple_files=True)
+    # Process new uploads into the session state basket
+    if current_uploads:
+        new_files = 0
+        for f in current_uploads:
+            if f.name not in st.session_state.accumulated_files:
+                st.session_state.accumulated_files[f.name] = f.getvalue()
+                new_files += 1
+        if new_files > 0:
+            st.success(f"✅ Added {new_files} new files to the basket!")
     
-    if uploaded_files:
-        received_count = len(uploaded_files)
-        
-        # NEW: Diagnostic Engine Output
-        st.markdown("---")
-        st.markdown("### 🔬 Upload Diagnostics")
-        
-        if received_count == expected_files:
-            st.success(f"✅ Perfect Match! You selected {expected_files} files and Streamlit received {received_count} files.")
-        else:
-            st.error(f"⚠️ MISMATCH DETECTED: You selected {expected_files} files, but the server only received {received_count} files. The browser or OS dropped {expected_files - received_count} files during the upload transfer.")
-            
-        with st.expander("👀 View Raw Data Received by Server", expanded=True):
-            for i, f in enumerate(uploaded_files):
-                st.code(f"File {i+1}:\nName: {f.name}\nSize: {f.size} bytes\nType: {f.type}", language="text")
-        st.markdown("---")
+    total_files = len(st.session_state.accumulated_files)
+    st.markdown(f"### 🛒 Basket: {total_files} Files Ready")
     
-    if st.button("🚀 Run Backtest (Uploaded Files)"):
-        files_to_process = uploaded_files
-        run_backtest = True
+    if total_files > 0:
+        with st.expander("👀 View Accumulated Files"):
+            for name in st.session_state.accumulated_files.keys():
+                st.text(f"• {name}")
+                
+        col_run, col_clear = st.columns(2)
+        with col_run:
+            if st.button("🚀 Run Backtest on Basket"):
+                # Convert the byte data back into File-like objects for pandas
+                files_to_process = []
+                for name, data_bytes in st.session_state.accumulated_files.items():
+                    file_obj = io.BytesIO(data_bytes)
+                    file_obj.name = name
+                    files_to_process.append(file_obj)
+                run_backtest = True
+                
+        with col_clear:
+            if st.button("🗑️ Empty Basket"):
+                st.session_state.accumulated_files = {}
+                st.rerun()
 
 with tab2:
     pasted_csv = st.text_area("Paste Streak CSV data here:", height=200, placeholder="s_no,seg_sym,sector,ltp,change,volume,time\n1,NSE:RELIANCE,,2500,1.5,50000,2026-07-22 09:30:00")
@@ -92,10 +108,9 @@ with tab2:
         else:
             st.error("⚠️ Please paste some CSV data first.")
 
+# Execution Engine Block
 if run_backtest:
-    if not files_to_process:
-        st.error("⚠️ Please upload a file or paste CSV data before running.")
-    elif not upstox_token:
+    if not upstox_token:
         st.error("❌ Cannot proceed: UPSTOX_ACCESS_TOKEN is missing from Secrets.")
     else:
         progress_bar = st.progress(0)
