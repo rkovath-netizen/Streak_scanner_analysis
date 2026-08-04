@@ -1,0 +1,10 @@
+Symbol,Lot Size,Entry Time,Exit Time,Days Held,Exit Reason,Long Equity PnL (₹),Long Equity Return (%),Short Equity PnL (₹),Short Equity Return (%),Options: Naked Call Buy PnL (₹),Options: Naked Call Buy Return (%),Options: Naked Put Buy PnL (₹),Options: Naked Put Buy Return (%),Options: Long Straddle PnL (₹),Options: Long Straddle Return (%),Options: Bull Put Spread (ATM & OTM1) PnL (₹),Options: Bull Put Spread (ATM & OTM1) Return (%),Options: Bull Put Spread (ATM & OTM2) PnL (₹),Options: Bull Put Spread (ATM & OTM2) Return (%),Options: Bear Call Spread (ATM & OTM1) PnL (₹),Options: Bear Call Spread (ATM & OTM1) Return (%),Options: Bear Call Spread (ATM & OTM2) PnL (₹),Options: Bear Call Spread (ATM & OTM2) Return (%)
+INDIGO,1,2026-07-17 12:00:00,2026-07-23 09:15:00,5,SL Hit on Gap-Down,-179.0,-3.41,179.0,3.41,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+BPCL,1,2026-07-17 12:45:00,2026-07-23 09:15:00,5,SL Hit on Gap-Down,-9.55,-3.03,9.55,3.03,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+IDFCFIRSTB,1,2026-07-17 14:15:00,2026-07-24 09:15:00,6,Time Exit (5 Days),-0.7,-0.87,0.7,0.87,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+PRESTIGE,1,2026-07-17 14:45:00,2026-07-17 14:45:00,1,Target Hit (+5.0%),1684.9,0.0,-1684.9,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+BPCL,1,2026-07-17 15:00:00,2026-07-20 10:38:00,2,SL Hit (-3.0%),-9.15,-2.87,9.15,2.87,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+EXIDEIND,1,2026-07-17 15:00:00,2026-07-24 09:15:00,6,Time Exit (5 Days),-6.6,-1.49,6.6,1.49,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+BAJAJ-AUTO,1,2026-07-17 15:00:00,2026-07-22 12:57:00,4,Target Hit (+5.0%),513.5,4.91,-513.5,-4.91,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+ICICIBANK,1,2026-07-17 15:15:00,2026-07-24 09:15:00,6,Time Exit (5 Days),-36.0,-2.46,36.0,2.46,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
+NUVAMA,1,2026-07-20 09:30:00,2026-07-20 12:51:00,1,SL Hit (-3.0%),-57.5,-3.01,57.5,3.01,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0
