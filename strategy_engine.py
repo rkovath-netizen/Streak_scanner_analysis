@@ -27,7 +27,17 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
         return pd.DataFrame()
 
     combined_df = pd.concat(all_signals, ignore_index=True)
-    combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
+    
+    # -------------------------------------------------------------
+    # FIX: Clean the timezone from Streak CSV to match Upstox Data
+    # -------------------------------------------------------------
+    try:
+        combined_df['time'] = pd.to_datetime(combined_df['time'], errors='coerce')
+        if combined_df['time'].dt.tz is not None:
+            combined_df['time'] = combined_df['time'].dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+    except Exception as e:
+        log_func(f"❌ Error parsing time column: {e}")
+        
     combined_df = combined_df.dropna(subset=['time'])
     
     trade_results = []
@@ -122,10 +132,14 @@ def process_streak_comparative_batch(csv_files, upstox_token, setup_direction, t
             else:
                 legs = get_option_legs(clean_symbol, entry_time, entry_price, strat, log_func=log_func)
                 
+                # Prevents UI log spam by only alerting once per stock
                 if not legs and strat == "Options: Naked Call Buy":
                     log_func(f"⚠️ Chain unavailable for {clean_symbol}")
                 
                 for leg in legs:
+                    if leg['key'] is None:
+                        continue
+                        
                     cache_key = f"{leg['key']}_{fetch_start.date()}"
                     if cache_key not in api_cache:
                         api_cache[cache_key] = fetch_upstox_intraday_candles(leg['key'], fetch_start, fetch_end, upstox_token, is_key=True, log_func=log_func)
