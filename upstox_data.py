@@ -2,6 +2,8 @@ import requests
 import pandas as pd
 import pytz
 import streamlit as st
+import urllib.parse  # Added to fix the HTTP 400 URL error
+from datetime import datetime
 
 UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 UPSTOX_HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle/{instrument_key}/{unit}/{to_date}/{from_date}"
@@ -24,7 +26,8 @@ def get_nfo_lot_size(symbol):
     if not derivatives.empty: return int(derivatives.iloc[0]['lot_size'])
     return 1 
 
-def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="15minute", is_key=False, log_func=print):
+# Changed default interval to '1minute' to comply with Upstox API rules
+def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token, interval="1minute", is_key=False, log_func=print):
     df_inst = get_instrument_df()
     if df_inst.empty:
         log_func("⚠️ Instrument master is empty.")
@@ -40,13 +43,25 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
     else:
         instrument_key = symbol_or_key
 
+    # FIX 1: Safely URL encode the instrument key to prevent HTTP 400 (converts | to %7C)
+    safe_instrument_key = urllib.parse.quote(instrument_key)
+
+    # FIX 2: Ensure the end date doesn't exceed today (Upstox rejects future dates with HTTP 400)
+    current_date = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
+    if end_dt > current_date:
+        end_dt = current_date
+
     url = UPSTOX_HISTORICAL_URL.format(
-        instrument_key=instrument_key, unit=interval,
-        to_date=end_dt.strftime("%Y-%m-%d"), from_date=start_dt.strftime("%Y-%m-%d")
+        instrument_key=safe_instrument_key, 
+        unit=interval,
+        to_date=end_dt.strftime("%Y-%m-%d"), 
+        from_date=start_dt.strftime("%Y-%m-%d")
     )
+    
     try:
         headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
         response = requests.get(url, headers=headers, timeout=10)
+        
         if response.status_code == 200:
             candles = response.json().get("data", {}).get("candles", [])
             if not candles:
