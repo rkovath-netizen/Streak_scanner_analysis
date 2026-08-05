@@ -3,6 +3,7 @@ import pandas as pd
 import pytz
 import streamlit as st
 import urllib.parse
+import time
 from datetime import datetime
 
 UPSTOX_INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
@@ -60,7 +61,6 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
     if start_dt > current_date:
         return pd.DataFrame()
 
-    # Route to the correct Upstox endpoint based on whether the instrument is expired
     base_url = UPSTOX_EXPIRED_HISTORICAL_URL if is_expired else UPSTOX_HISTORICAL_URL
     url = base_url.format(
         instrument_key=safe_instrument_key, 
@@ -71,8 +71,15 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
     
     try:
         headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
-        response = requests.get(url, headers=headers, timeout=10)
+        req_start = time.time()
         
+        response = requests.get(url, headers=headers, timeout=10)
+        req_end = time.time()
+        
+        # Only log HTTP errors or extremely slow queries for historical data to avoid spamming the UI
+        if response.status_code != 200 or (req_end - req_start) > 2.0:
+            log_func(f"📡 [Hist API] HTTP {response.status_code} | Time: {req_end - req_start:.2f}s | Key: {instrument_key}")
+            
         if response.status_code == 200:
             candles = response.json().get("data", {}).get("candles", [])
             if not candles:
@@ -82,14 +89,17 @@ def fetch_upstox_intraday_candles(symbol_or_key, start_dt, end_dt, access_token,
             return df.sort_values("timestamp").reset_index(drop=True)
         else:
             return pd.DataFrame()
-    except Exception:
+    except requests.exceptions.Timeout:
+        log_func(f"🚨 [Hist API] TIMEOUT (>10s) for {instrument_key}")
+        return pd.DataFrame()
+    except Exception as e:
+        log_func(f"🚨 [Hist API] Exception: {e}")
         return pd.DataFrame()
 
 def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log_func=print):
     df_inst = get_instrument_df()
     if df_inst.empty: return []
     
-    # 1. Get the underlying Cash Instrument Key (Required for the API calls)
     eq_rows = df_inst[(df_inst['tradingsymbol'] == symbol) & (df_inst['exchange'] == 'NSE_EQ')]
     if eq_rows.empty:
         if strategy == "Options: Naked Call Buy":
@@ -103,7 +113,6 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log
     entry_date = pd.to_datetime(entry_time).date()
     current_date = pd.Timestamp.now(tz="Asia/Kolkata").date()
     
-    # 2. Fetch ALL Expiries (Merge Live Expiries + Expired Expiries via API)
     active_expiries = []
     if 'underlying_symbol' in df_inst.columns:
         opts_active = df_inst[(df_inst['exchange'] == 'NSE_FO') & (df_inst['underlying_symbol'] == symbol)]
@@ -115,14 +124,22 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log
         
     expired_expiries = []
     try:
-        # Upstox Expired Instruments API
+        req_start = time.time()
+        log_func(f"⏳ [API] Fetching Expiries for {symbol}...")
+        
         exp_url = f"https://api.upstox.com/v2/expired-instruments/expiries?instrument_key={safe_eq_key}"
-        res = requests.get(exp_url, headers=headers, timeout=5)
+        res = requests.get(exp_url, headers=headers, timeout=10)
+        req_end = time.time()
+        
+        log_func(f"📡 [API] Expiries Response: HTTP {res.status_code} | Time: {req_end - req_start:.2f}s")
+        
         if res.status_code == 200:
             data = res.json().get('data', [])
             expired_expiries = [pd.to_datetime(d).date() for d in data]
-    except Exception:
-        pass 
+    except requests.exceptions.Timeout:
+        log_func(f"🚨 [API] Expiries TIMEOUT for {symbol}")
+    except Exception as e:
+        log_func(f"🚨 [API] Expiries Exception: {e}")
 
     all_expiries = sorted(list(set(active_expiries + expired_expiries)))
     future_expiries = [d for d in all_expiries if d >= entry_date]
@@ -135,18 +152,22 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log
     closest_expiry = future_expiries[0]
     is_expired = closest_expiry < current_date
     
-    # 3. Methodically Fetch EXACT Option Contracts for that Expiry
     chain_df = pd.DataFrame()
     if is_expired:
         try:
-            # Upstox Expired Option Contracts API
+            req_start = time.time()
+            log_func(f"⏳ [API] Fetching Contracts for {symbol} ({closest_expiry})...")
+            
             opt_url = f"https://api.upstox.com/v2/expired-instruments/option/contract?instrument_key={safe_eq_key}&expiry_date={closest_expiry.strftime('%Y-%m-%d')}"
-            res = requests.get(opt_url, headers=headers, timeout=5)
+            res = requests.get(opt_url, headers=headers, timeout=10)
+            req_end = time.time()
+            
+            log_func(f"📡 [API] Contracts Response: HTTP {res.status_code} | Time: {req_end - req_start:.2f}s")
+            
             if res.status_code == 200:
                 contracts = res.json().get('data', [])
                 chain_df = pd.DataFrame(contracts)
                 if not chain_df.empty:
-                    # Normalize Upstox JSON keys to our logic
                     if 'strike_price' in chain_df.columns:
                         chain_df.rename(columns={'strike_price': 'strike'}, inplace=True)
                     if 'trading_symbol' in chain_df.columns:
@@ -155,7 +176,11 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log
                 if strategy == "Options: Naked Call Buy":
                     log_func(f"❌ {symbol}: Failed API fetch for expired options (HTTP {res.status_code})")
                 return []
+        except requests.exceptions.Timeout:
+            log_func(f"🚨 [API] Contracts TIMEOUT for {symbol} ({closest_expiry})")
+            return []
         except Exception as e:
+            log_func(f"🚨 [API] Contracts Exception: {e}")
             return []
     else:
         if 'underlying_symbol' in df_inst.columns:
@@ -166,7 +191,6 @@ def get_option_legs(symbol, entry_time, entry_price, strategy, access_token, log
     if chain_df.empty:
         return []
 
-    # 4. Process the cleanly fetched exact strikes
     chain_df['strike'] = pd.to_numeric(chain_df['strike'], errors='coerce')
     chain_df = chain_df.dropna(subset=['strike'])
     unique_strikes = sorted(chain_df['strike'].unique())
